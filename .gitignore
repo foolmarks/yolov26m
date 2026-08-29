@@ -1,0 +1,21 @@
+# Model checkpoints and ONNX exports - regenerate with get_yolo26m.py and rewrite_yolo26m.py
+models/
+
+# Compiled model, quantization artifacts and annotated inference output
+# - regenerate with run_onnx.py, run_onnx_mod.py and run_modelsdk.py
+build/
+
+# COCO samples - regenerate with get_coco.py
+calib_images/
+test_images/
+
+# Benchmark reports - regenerate with benchmark/main.py
+benchmark/results/
+
+# SDK container state: logs and SDK certificates. Never commit these.
+.ghcr.io-sima-neat-sdk-v*/
+.insight-media/
+
+# Python
+__pycache__/
+*.py[cod]

@@ -1,0 +1,8 @@
+model:                       # Model package selection.
+  path: /workspace/build/yolo26m_mod/yolo26m_mod_mpk.tar.gz
+
+benchmark:                   # Synthetic benchmark settings.
+  frames: 1000               # Number of synthetic frames to run.
+
+output:                      # Benchmark report output.
+  report_json: /workspace/benchmark/results/report.json # JSON report path.
