@@ -1,0 +1,36 @@
+# YOLOv26m USB webcam -> Neat Insight.
+# Relative paths resolve against this file's directory.
+
+model:
+  path: ../../build/yolo26m_mod/yolo26m_mod_mpk.tar.gz   # compiled BF16 MPK
+  labels: coco_labels.txt                                # 80 COCO class names
+  input_width: 640       # model input; also the size of the displayed frame
+  input_height: 640
+  pad_value: 114         # Ultralytics letterbox fill
+
+camera:
+  device:                # blank = auto-detect the uvcvideo capture node
+  width: 640             # NV12 mode closest to the 640x640 model input
+  height: 480
+  fps: 30                # highest rate the camera offers for NV12 640x480
+
+detection:
+  score_threshold: 0.40  # BoxDecode minimum object confidence
+  nms_iou: 0.60          # BoxDecode overlap threshold
+  max_detections: 50     # BoxDecode top-k per frame
+
+insight:
+  host: 10.42.0.1        # laptop running Neat Insight, reached over Ethernet
+  channel: 0             # Insight viewer channel; video port = base + channel
+  video_port_base: 9000
+  bitrate_kbps: 4000
+
+runtime:
+  frames: 0              # 0 = stream until interrupted
+  pull_timeout_ms: 10000
+  profile: false         # print graph backends at startup and periodic throughput
+  profile_interval: 60
+
+output:
+  save_dir: ../results_insight  # where save_every writes annotated JPEGs
+  save_every: 0                 # 0 = off; N = also write every Nth annotated frame

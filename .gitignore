@@ -12,6 +12,9 @@ test_images/
 # Benchmark reports - regenerate with benchmark/main.py
 benchmark/results/
 
+# Annotated frames optionally saved by yolov26m_insight (output.save_every)
+results_insight/
+
 # SDK container state: logs and SDK certificates. Never commit these.
 .ghcr.io-sima-neat-sdk-v*/
 .insight-media/

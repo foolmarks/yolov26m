@@ -212,3 +212,111 @@ Execute the instructions in benchmark.md. Do not make assumptions, ask for clari
 The prompt above generates ./benchmark, which can then be re-run directly. The benchmark is a
 pyneat application, so there is nothing to cross-compile - `dk` copies nothing and runs the script
 on the paired devkit over the shared /workspace mount.
+
+
+## STEP 8: Create and execute a pipeline using Agentic AI
+
+Run the following in the Agentic AI (Claude, Codex, Gemini...) of your choice:
+
+```shell
+Execute the instructions in create_application_insight.md. Do not make assumptions, ask for clarification.
+```
+
+The prompt above generates ./yolov26m_insight, a C++ Neat application that runs continuously on the
+paired devkit: it captures NV12 640x480 frames from the USB webcam, preprocesses them on the EV74 CVU
+(colour convert to RGB, Ultralytics letterbox to 640x640, normalize, tessellate), runs the compiled
+model on the MLA, decodes the YOLOv26 boxes on the EV74, draws the boxes and labels onto the resized
+and padded 640x640 frame on the APU, and streams the annotated video as H.264 over RTP/UDP to Neat
+Insight on the host laptop. Operation is asynchronous - a capture thread pushes frames while the main
+thread pulls `(frame, detections)` pairs matched by frame ID.
+
+The displayed frame is the letterboxed 640x640 image rather than the raw capture, so the stream shows
+exactly the geometry the model saw: the 640x480 content centred with 80 rows of pad above and below.
+Box coordinates come back from the decoder in source-image space and are mapped through the same
+letterbox transform before they are drawn. That display-side letterbox is applied on the APU, not
+tapped from the CVU - the model route's own RGB output is internal to the route, and a second
+`nodes::Preproc` stage cannot be constructed from an application in this SDK build. At 640x480 into
+640x640 the letterbox scale is exactly 1.0, so the APU version is a pure border pad and matches the
+CVU result pixel for pixel. The application README has the details.
+
+It also writes ./brio-4k-stream-edition.md, the capability report for the attached USB camera, which
+records why NV12 640x480 @30 fps was the mode selected.
+
+
+### Build
+
+Unlike the pyneat benchmark in STEP 7, this is a C++ application and has to be cross-compiled for the
+ARM64 target. Run this *inside* the Neat docker container - it exports the aarch64 toolchain that the
+build script uses. There is nothing to copy afterwards, because /workspace is NFS-mounted on the devkit.
+
+```shell
+[DevKit 10.42.0.23:/workspace] user@neat-sdk-v2.1.3.0:/workspace$ ./yolov26m_insight/build.sh
+```
+
+
+### Run
+
+```shell
+[DevKit 10.42.0.23:/workspace] user@neat-sdk-v2.1.3.0:/workspace$ ./yolov26m_insight/run.sh
+```
+
+`run.sh` is a thin wrapper around `dk`; the equivalent direct invocation is:
+
+```shell
+[DevKit 10.42.0.23:/workspace] user@neat-sdk-v2.1.3.0:/workspace$ dk /workspace/yolov26m_insight/build/yolov26m-insight --config /workspace/yolov26m_insight/config/config.yaml
+```
+
+On startup it reports the camera mode it negotiated and where it is sending video:
+
+```shell
+camera=/dev/video96 format=NV12 640x480@30 frame_bytes=460800
+letterbox=640x640 scale=1.0000 content=640x480 pad=(0,80) pad_value=114
+insight=10.42.0.1:9000 channel=0 codec=H264 bitrate=4000kbps frame=640x640
+streaming — press Ctrl+C to stop
+```
+
+The application streams until interrupted. Press `Ctrl+C`; it closes both pipelines and releases the
+camera on every exit path.
+
+Detection thresholds, the camera mode, the Insight host and channel, and an optional debug mode that
+writes annotated JPEGs to disk are all set in ./yolov26m_insight/config/config.yaml. See
+[the application README](./yolov26m_insight/README.md) for the full table.
+
+
+### View the annotated stream
+
+Insight must be running for this step - check with `insight-admin status` inside the container. The
+application streams regardless, because RTP over UDP is fire-and-forget; only the viewing end needs
+Insight up.
+
+Open the Insight Video Viewer in a browser *on the laptop* and select channel 0:
+
+```text
+https://127.0.0.1:8081/static/viewer.html?mode=light&src=0&max_channels=4
+```
+
+Use loopback here, not `10.42.0.1`. Insight's UI ports answer on `127.0.0.1` only; `10.42.0.1` is the
+address the *devkit* sends video to, which is the opposite direction. Ask the backend for the
+canonical link rather than hand-building it:
+
+```shell
+$ curl -k 'https://127.0.0.1:9900/api/viewer-url?src=0'
+```
+
+The main Insight UI is at `https://127.0.0.1:9900`. The bounding boxes are burned into the video
+frames, so they render in the viewer without a metadata overlay.
+
+![Annotated webcam frame streamed to Neat Insight](./readme_images/insight_annotated.jpg)
+
+If the viewer shows nothing, check that the stream is actually reaching Insight before suspecting the browser:
+
+```shell
+$ curl -k https://127.0.0.1:9900/api/ingest/stats
+```
+
+Channel 0 should show `rtp.packets_received` climbing, `media.seen_sps` and `media.seen_pps` true, and
+`media.idr_count` growing. Note that `forwarding.webrtc_track_attached` stays `false` - with
+`packets_dropped_no_track` climbing - until a viewer is actually open. That is expected, not a fault.
+
+
+
