@@ -22,3 +22,10 @@ results_insight/
 # Python
 __pycache__/
 *.py[cod]
+
+# EdItor, IDE
+.vscode/
+
+camera_capabilities.md
+
+

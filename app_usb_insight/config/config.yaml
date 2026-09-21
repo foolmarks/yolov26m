@@ -1,0 +1,32 @@
+# YOLOv26m USB webcam -> Neat Insight, annotated in NV12.
+# Relative paths resolve against this file's directory.
+
+model:
+  path: ../../build/yolo26m_mod/yolo26m_mod_mpk.tar.gz   # compiled INT8 MPK
+  labels: coco_labels.txt                                # 80 COCO class names
+  input_width: 640       # model input (the CVU letterbox target)
+  input_height: 640
+  pad_value: 0           # black letterbox padding on the model path
+
+camera:
+  device:                # blank = auto-detect the uvcvideo capture node
+  width: 1920            # also the annotated frame and stream size
+  height: 1080
+  fps: 30                # highest rate the BRIO offers for NV12 1920x1080
+
+detection:
+  score_threshold: 0.25  # BoxDecode minimum object confidence (conf)
+  nms_iou: 0.50          # BoxDecode overlap threshold, as compiled into 0_boxdecoder.json
+  max_detections: 300    # BoxDecode top-k per frame (max_det)
+
+insight:
+  host: 192.168.1.29     # Ubuntu laptop running Neat Insight
+  channel: 0             # Insight viewer channel; video port = base + channel
+  video_port_base: 9000
+  bitrate_kbps: 8000     # H.264 target for 1080p
+
+runtime:
+  frames: 0              # 0 = stream until interrupted
+  pull_timeout_ms: 10000
+  profile: true          # print graph backends at startup and periodic throughput
+  profile_interval: 60

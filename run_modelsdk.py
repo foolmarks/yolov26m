@@ -36,13 +36,14 @@ Quantize, evaluate and compile the post-surgery YOLO26-m model with the SiMa
 Model SDK. The quantization parameters can be adjusted via command line args.
 
 The ONNX model is loaded into the SDK's LoadedNet form, calibrated on images
-from ./calib_images - sample count, calibration method (mse, min_max,
-moving_average, entropy, percentile), bias correction and channel equalization
-are all selectable - and quantized to int8 or bf16 (BF16 skips calibration).
+from ./calib_images and quantized to int8 or bf16 (BF16 skips calibration), then
+saved to the build folder.
 
-With -e, the quantized model is evaluated on ./test_images: the six raw head
-outputs are decoded in numpy (sigmoid on the class logits, ltrb box decode,
-confidence filter) and annotated images are written to the build folder.
+With -e the quantized model is evaluated on ./test_images: the six raw head
+outputs are decoded in numpy the way Neat's BoxDecode decodes them on the target
+(sigmoid on the class logits, ltrb distance decode, best class per anchor,
+confidence filter, top-k cap, no NMS) and the annotated images are written to
+./build/quant_pred.
 
 Unless --no_compile, the model is compiled for the target (Gen 1 DaVinci or
 Gen 2 Modalix) and packed as an MPK .tar.gz in the build folder.
@@ -51,7 +52,7 @@ Gen 2 Modalix) and packed as an MPK .tar.gz in the build folder.
 
 """
 Author: Mark Harvey
-Created: 28 Aug 2026
+Created: 20 Sep 2026
 """
 
 
@@ -94,85 +95,28 @@ import utils
 DIVIDER = "-" * 50
 IMAGE_EXTENSIONS = {".bmp", ".gif", ".jpeg", ".jpg", ".png"}
 
-# Letterbox fill used by the float pipeline (run_onnx_mod.py).
-PAD_VALUE = 114
-
 # Head geometry of models/yolo26m_mod.onnx: 4 ltrb channels, 80 COCO classes.
 BBOX_CHANNELS = 4
 NUM_CLASSES = 80
 
+# Ops that would mean a class head already emits probabilities, not logits.
+ACTIVATION_OPS = {"Sigmoid", "Softmax", "HardSigmoid", "LogSoftmax"}
+
 
 InputDim = Union[int, str, None]
 InputShape = Optional[Tuple[InputDim, ...]]
-ShapesByName = Dict[str, InputShape]
-DtypesByName = Dict[str, Optional[Union[ScalarType, str]]]
-
-# Same maps either way; the names just say which side of the graph they describe.
-InputShapesByName = ShapesByName
-InputDtypesByName = DtypesByName
-OutputShapesByName = ShapesByName
-OutputDtypesByName = DtypesByName
+InputShapesByName = Dict[str, InputShape]
+InputDtypesByName = Dict[str, Optional[Union[ScalarType, str]]]
 
 
-def _tensor_shape_dtype(
-    value_info: onnx.ValueInfoProto, role: str
-) -> Tuple[InputShape, Optional[Union[ScalarType, str]]]:
-    """
-    Describe one ONNX tensor's shape and dtype.
-
-    Shared by the graph's inputs and outputs so both are read the same way.
-
-    Args:
-        value_info: the ValueInfoProto to describe.
-        role: "input" or "output", used only in the not-float32 warning.
-
-    Returns:
-        Tuple of (shape, dtype), where:
-            shape: (d0, d1, ...) with each dimension an int for a fixed size, a
-                str for a symbolic dimension, or None if present but unknown;
-                the whole value is None if the tensor is rank-unknown.
-            dtype: ScalarType.float32 for float32, otherwise the NumPy-style
-                dtype string (e.g. 'float16', 'int64'), or None if unknown.
-    """
-    ttype = value_info.type.tensor_type
-
-    # ----- dtype -----
-    np_dtype = onnx.mapping.TENSOR_TYPE_TO_NP_TYPE.get(ttype.elem_type, None)
-    if np_dtype is None:
-        dtype = None
-    else:
-        dtype_name = np_dtype.name  # e.g., 'float32', 'int64'
-        if dtype_name == "float32":
-            dtype = ScalarType.float32
-        else:
-            dtype = dtype_name
-            print(f"Warning - {role} {value_info.name} is not float32")
-
-    # ----- shape -----
-    if not ttype.HasField("shape"):
-        return None, dtype  # rank-unknown
-
-    dims_list = []
-    for d in ttype.shape.dim:
-        if d.HasField("dim_value"):
-            dims_list.append(int(d.dim_value))  # fixed dimension
-        elif d.HasField("dim_param"):
-            dims_list.append(d.dim_param)  # symbolic dimension
-        else:
-            dims_list.append(None)  # unknown dimension
-
-    # Store as immutable tuple
-    return tuple(dims_list), dtype
 
 
-def _get_onnx_shapes_dtypes(
+def _get_onnx_input_shapes_dtypes(
     model_path: Path,
-) -> Tuple[
-    InputShapesByName, InputDtypesByName, OutputShapesByName, OutputDtypesByName
-]:
+) -> Tuple[InputShapesByName, InputDtypesByName]:
     """
-    Load an ONNX model and return four dictionaries describing its *true* inputs
-    and its outputs, ignoring any graph initializers (weights/biases).
+    Load an ONNX model and return two dictionaries describing its *true* inputs,
+    ignoring any graph initializers (weights/biases).
 
     Returns:
         shapes_by_input:
@@ -186,10 +130,6 @@ def _get_onnx_shapes_dtypes(
               - if the ONNX dtype is float32 -> the value is the symbol ScalarType.float32
               - otherwise -> the original NumPy-style dtype string (e.g., 'float16', 'int64')
               - or None if it could not be determined.
-        shapes_by_output:
-            { output_name: shape }, same encoding as shapes_by_input.
-        dtypes_by_output:
-            { output_name: dtype }, same encoding as dtypes_by_input.
     """
     # Parse and sanity-check the model graph structure.
     model = onnx.load(str(model_path))
@@ -201,8 +141,6 @@ def _get_onnx_shapes_dtypes(
     # Plain dictionaries
     shapes_by_input = {}
     dtypes_by_input = {}
-    shapes_by_output = {}
-    dtypes_by_output = {}
 
     # Iterate over declared graph inputs
     for vi in model.graph.input:
@@ -213,21 +151,99 @@ def _get_onnx_shapes_dtypes(
         if not vi.type.HasField("tensor_type"):
             continue
 
-        shapes_by_input[vi.name], dtypes_by_input[vi.name] = _tensor_shape_dtype(
-            vi, "input"
-        )
+        ttype = vi.type.tensor_type
 
-    # Iterate over declared graph outputs
-    for vi in model.graph.output:
-        # Only handle tensor outputs
-        if not vi.type.HasField("tensor_type"):
+        # ----- dtype -----
+        elem_type = ttype.elem_type
+        np_dtype = onnx.mapping.TENSOR_TYPE_TO_NP_TYPE.get(elem_type, None)
+
+        if np_dtype is None:
+            dtypes_by_input[vi.name] = None
+        else:
+            dtype_name = np_dtype.name  # e.g., 'float32', 'int64'
+            if dtype_name == "float32":
+                dtypes_by_input[vi.name] = ScalarType.float32
+            else:
+                dtypes_by_input[vi.name] = dtype_name
+                print(f"Warning - input {vi.name} is not float32")
+
+        # ----- shape -----
+        if not ttype.HasField("shape"):
+            shapes_by_input[vi.name] = None  # rank-unknown
             continue
 
-        shapes_by_output[vi.name], dtypes_by_output[vi.name] = _tensor_shape_dtype(
-            vi, "output"
+        dims_list = []
+        for d in ttype.shape.dim:
+            if d.HasField("dim_value"):
+                dims_list.append(int(d.dim_value))  # fixed dimension
+            elif d.HasField("dim_param"):
+                dims_list.append(d.dim_param)  # symbolic dimension
+            else:
+                dims_list.append(None)  # unknown dimension
+
+        # Store as immutable tuple
+        shapes_by_input[vi.name] = tuple(dims_list)
+
+    return shapes_by_input, dtypes_by_input
+
+
+def _check_class_heads_are_logits(model_path: Path) -> None:
+    """
+    Confirm the class heads of the post-surgery model emit raw logits.
+
+    The post-processing below applies its own sigmoid, exactly as Neat's
+    BoxDecode does on the target, so a graph that already activates its class
+    scores would be double-activated and every score would be wrong. The check
+    looks at the node producing each 80-channel graph output and rejects the
+    model if it is an activation rather than the bare cv3 Conv.
+
+    Args:
+        model_path: path to the post-surgery ONNX model.
+
+    Raises:
+        ValueError: if no class head is found, or if one is already activated.
+    """
+    model = onnx.load(str(model_path))
+    graph = model.graph
+
+    # Map every graph output to the node that produces it.
+    producer_by_tensor = {
+        output_name: node for node in graph.node for output_name in node.output
+    }
+
+    class_outputs: List[str] = []
+    for value_info in graph.output:
+        dims = value_info.type.tensor_type.shape.dim
+        # (N, C, H, W): a class head is the one carrying NUM_CLASSES channels.
+        if len(dims) == 4 and dims[1].dim_value == NUM_CLASSES:
+            class_outputs.append(value_info.name)
+
+    if not class_outputs:
+        raise ValueError(
+            f"No {NUM_CLASSES}-channel class output found in {model_path}; this "
+            f"does not look like a model produced by rewrite_yolo26m.py."
         )
 
-    return shapes_by_input, dtypes_by_input, shapes_by_output, dtypes_by_output
+    activated = {
+        name: producer_by_tensor[name].op_type
+        for name in class_outputs
+        if name in producer_by_tensor
+        and producer_by_tensor[name].op_type in ACTIVATION_OPS
+    }
+    if activated:
+        raise ValueError(
+            f"Class head(s) {activated} already apply an activation, so they emit "
+            f"probabilities, not raw logits. The post-processing in this script "
+            f"applies its own sigmoid and would double-activate them. Re-run "
+            f"rewrite_yolo26m.py to cut the class heads before the Sigmoid."
+        )
+
+    producers = ", ".join(
+        f"{name} <- {producer_by_tensor[name].op_type}"
+        for name in class_outputs
+        if name in producer_by_tensor
+    )
+    print(f"Class heads emit raw logits ({producers})", flush=True)
 
 
 def _build_tessellate_parameters(mla_tess: bool, mla_detess: bool, quant_model: Any) -> Dict[str, TensorTessellateParameters]:
@@ -241,7 +257,7 @@ def _build_tessellate_parameters(mla_tess: bool, mla_detess: bool, quant_model: 
     print(DIVIDER, flush=True)
     print("Internal graph structure (for tessellate parameters):", flush=True)
     print(f"  Input node names: {quant_model._net.input_node_names}", flush=True)
-    print(f"  Output node names: {quant_model._net.output_node_name}", flush=True)
+    print(f"  Output node name: {quant_model._net.output_node_name}", flush=True)
 
     # Show all nodes to find placeholder names
     print("  All nodes:", flush=True)
@@ -353,28 +369,12 @@ def _prepare_results_dir(build_dir: Path, model_path: Path) -> Tuple[Path, str]:
     return results_dir, output_model_name
 
 
-# ---------------------------------------------------------------------------
-# Pre-processing
-#
-# The images are expected to be letterboxed to the model's input size already -
-# that is what get_coco.py writes into ./calib_images and ./test_images. So there
-# is no resize or pad here, only the tensor conversion. An image that is not
-# already at the input size is rejected rather than silently letterboxed, because
-# the boxes would then be in a space the evaluation no longer corrects for.
-#
-# The same path is used for calibration and evaluation data, as the SDK requires.
-# ---------------------------------------------------------------------------
-
-
 def _to_tensor(img_bgr: np.ndarray, target_h: int, target_w: int) -> np.ndarray:
     """
     Convert an already-letterboxed BGR image into the model's input tensor.
 
-    BGR -> RGB, scale to [0, 1] and add the batch dimension. The SDK wants NHWC
-    even though the ONNX graph is NCHW, so no transpose is applied.
-
     Args:
-        img_bgr: source image as an (H, W, 3) BGR array.
+        img_bgr: source image as an (H, W, 3) BGR uint8 array.
         target_h: network input height.
         target_w: network input width.
 
@@ -384,6 +384,12 @@ def _to_tensor(img_bgr: np.ndarray, target_h: int, target_w: int) -> np.ndarray:
     Raises:
         ValueError: if the image is not already at the model's input size.
     """
+    # === AGENT:BEGIN Image preprocessing ===
+    # BGR -> RGB, /255 into [0.0, 1.0], batch dimension. No resize, crop or pad:
+    # get_coco.py already writes ./calib_images and ./test_images letterboxed to
+    # the model input size, and rescaling here would put the decoded boxes in a
+    # coordinate space the evaluation does not correct for. The SDK wants NHWC
+    # even though the ONNX graph is NCHW, so no channel transpose is applied.
     img_h, img_w = img_bgr.shape[:2]
     if (img_h, img_w) != (target_h, target_w):
         raise ValueError(
@@ -393,12 +399,16 @@ def _to_tensor(img_bgr: np.ndarray, target_h: int, target_w: int) -> np.ndarray:
         )
 
     img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
-    return np.expand_dims(img_rgb, axis=0)
+    preprocessed_image = np.expand_dims(img_rgb, axis=0)
+    # === AGENT:END Image preprocessing ===
+    return preprocessed_image
 
 
 def _preproc(image_path: Path, target_h: int, target_w: int) -> np.ndarray:
     """
     Load one already-letterboxed image and preprocess it for the model.
+
+    The same path is used for calibration and evaluation data, as the SDK requires.
 
     Args:
         image_path: path to the image file to preprocess.
@@ -419,18 +429,73 @@ def _preproc(image_path: Path, target_h: int, target_w: int) -> np.ndarray:
     return _to_tensor(img_bgr, target_h, target_w)
 
 
+def _data_prep(
+    folder_path: Path, num_images: int, input_shapes_dict: InputShapesByName
+) -> List[Dict[str, np.ndarray]]:
+    """
+    Build a list of input dictionaries from the images in a folder.
+
+    Args:
+        folder_path: folder holding the images.
+        num_images: maximum number of images to use.
+        input_shapes_dict: model input shapes, keyed by input name.
+
+    Returns:
+        List of {input_name: preprocessed NHWC tensor} dictionaries.
+    """
+    image_paths = _list_image_files(folder_path)[:num_images]
+
+    samples: List[Dict[str, np.ndarray]] = []
+    for image_path in image_paths:
+        samples.append(
+            {
+                name: _preproc(image_path, target_h=shape[2], target_w=shape[3])
+                for name, shape in input_shapes_dict.items()
+            }
+        )
+
+    return samples
+
+
+def _random_calib_data(
+    input_shapes_dict: InputShapesByName,
+) -> List[Dict[str, np.ndarray]]:
+    """
+    Build a single random calibration sample for BF16 quantization.
+
+    BF16 does not calibrate, but the API still needs one sample to establish
+    each input's shape and dtype.
+
+    Args:
+        input_shapes_dict: model input shapes, keyed by input name.
+
+    Returns:
+        Single-element list holding one random NHWC sample per input.
+    """
+    rng = np.random.default_rng(0)
+    return [
+        {
+            name: rng.random((1, shape[2], shape[3], shape[1]), dtype=np.float32)
+            for name, shape in input_shapes_dict.items()
+        }
+    ]
+
+
 # ---------------------------------------------------------------------------
 # Post-processing
 #
 # rewrite_yolo26m.py leaves six raw head tensors on the graph and deletes the
-# decode/selection tail, so all of that work happens here - same maths as
-# run_onnx_mod.py, but tolerant of layout. The class heads are cut at the cv3
-# Conv and carry logits, so the sigmoid is applied here. Because the images are already in
-# letterbox space, the decoded boxes are in the image's own coordinates and need
-# no inverse mapping. The SDK hands back NHWC while the
-# ONNX graph is NCHW, and at level 0 a class tensor is (1,80,80,80) either way,
-# so the layout is decided from the unambiguous 4-channel bbox tensors and then
-# applied to the class tensors.
+# decode/selection tail, so all of that work happens here - the same maths that
+# Neat's BoxDecode runs on the target. YOLO26 is DFL-free, so the four bbox
+# channels are the ltrb distances directly, in grid-cell units; the class heads
+# are cut at the cv3 Conv and carry logits, so the sigmoid is applied here.
+# Because the images are already in letterbox space, the decoded boxes are in the
+# image's own coordinates and need no inverse mapping. The one2one head is
+# NMS-free, so selection is a top-k and a confidence filter, nothing more.
+#
+# The SDK hands back NHWC while the ONNX graph is NCHW, and at level 0 a class
+# tensor is (1,80,80,80) either way, so the layout is decided from the
+# unambiguous 4-channel bbox tensors and then applied to the class tensors.
 # ---------------------------------------------------------------------------
 
 
@@ -531,12 +596,9 @@ def _decode_level(
     """
     Decode one head level into letterbox-pixel boxes and class probabilities.
 
-    YOLO26 is DFL-free, so the four bbox channels are the ltrb distances
-    directly, in grid-cell units. Anchors sit at (col + 0.5, row + 0.5) and the
-    box is (anchor -/+ distance) * stride, matching the decode the surgery
-    removed from the ONNX graph. The class tensor holds logits -
-    rewrite_yolo26m.py cuts the class heads at the cv3 Conv - so the sigmoid is
-    applied here.
+    Anchors sit at (col + 0.5, row + 0.5) in grid-cell units and the box is
+    (anchor -/+ distance) * stride, matching the dist2bbox decode the surgery
+    removed from the ONNX graph.
 
     Args:
         bbox_level: (1, 4, H, W) ltrb distances in grid-cell units.
@@ -546,6 +608,9 @@ def _decode_level(
 
     Returns:
         Tuple of (boxes_xyxy, scores) shaped (H*W, 4) and (H*W, C).
+
+    Raises:
+        ValueError: if the level's grid does not correspond to a square stride.
     """
     bbox = bbox_level[0]
     cls = cls_level[0]
@@ -614,9 +679,9 @@ def _postproc(
     """
     Decode the six post-surgery outputs into boxes, scores and class ids.
 
-    Concatenates the three levels, then reproduces the end-to-end selection the
-    surgery removed: top-k anchors by best class score, then a flat top-k over
-    the surviving score matrix. NMS-free, as the one2one head was trained to be.
+    Concatenates the three levels, then selects the way BoxDecode does: one
+    detection per anchor carrying that anchor's best class, a confidence filter
+    and a top-k cap. NMS-free, as the one2one head was trained to be.
 
     Args:
         outputs: list of six raw head tensors from Model.execute().
@@ -638,78 +703,41 @@ def _postproc(
     boxes = np.concatenate(level_boxes, axis=0)
     scores = np.concatenate(level_scores, axis=0)
 
-    # Stage 1: keep the max_det anchors with the highest single-class score.
-    anchor_idx = _topk(scores.max(axis=1), max_det)
-    boxes = boxes[anchor_idx]
-    scores = scores[anchor_idx]
+    # A BoxDecode BBOX record carries a single class_id, so each anchor yields
+    # at most one detection: its best class. Confidence filter first, then the
+    # top-k cap, so max_det bounds the detections that survive the threshold.
+    class_ids = scores.argmax(axis=1).astype(np.int64)
+    best = scores[np.arange(scores.shape[0]), class_ids]
 
-    # Stage 2: flat top-k over the surviving (anchor, class) pairs.
-    flat = scores.reshape(-1)
-    flat_idx = _topk(flat, max_det)
-    final_scores = flat[flat_idx]
-    class_ids = (flat_idx % scores.shape[1]).astype(np.int64)
-    final_boxes = boxes[flat_idx // scores.shape[1]]
+    keep = best >= conf_thres
+    boxes, best, class_ids = boxes[keep], best[keep], class_ids[keep]
 
-    keep = final_scores >= conf_thres
-    return final_boxes[keep], final_scores[keep], class_ids[keep]
+    order = _topk(best, max_det)
+    boxes, best, class_ids = boxes[order], best[order], class_ids[order]
 
+    # Clamp to the image; the raw ltrb distances can point outside it. Neat's
+    # parse_bbox_bytes clamps the decoded BBOX payload to [0, img_w] / [0, img_h],
+    # so the same bounds are used here.
+    boxes[:, 0::2] = np.clip(boxes[:, 0::2], 0.0, float(input_w))
+    boxes[:, 1::2] = np.clip(boxes[:, 1::2], 0.0, float(input_h))
 
-def _data_prep(
-    folder_path: Path, num_images: int, input_shapes_dict: InputShapesByName
-) -> List[Dict[str, np.ndarray]]:
-    """
-    Build a list of input dictionaries from the images in a folder.
-
-    The same preprocessing is used for calibration and evaluation data.
-
-    Args:
-        folder_path: folder holding the images.
-        num_images: maximum number of images to use.
-        input_shapes_dict: model input shapes, keyed by input name.
-
-    Returns:
-        List of {input_name: preprocessed NHWC tensor} dictionaries.
-    """
-    image_paths = _list_image_files(folder_path)[:num_images]
-
-    samples: List[Dict[str, np.ndarray]] = []
-    for image_path in image_paths:
-        sample = {
-            name: _preproc(image_path, target_h=shape[2], target_w=shape[3])
-            for name, shape in input_shapes_dict.items()
-        }
-        samples.append(sample)
-
-    return samples
-
-
-def _random_calib_data(
-    input_shapes_dict: InputShapesByName,
-) -> List[Dict[str, np.ndarray]]:
-    """
-    Build a single random calibration sample for BF16 quantization.
-
-    BF16 does not calibrate, but the API still needs one sample to establish
-    each input's shape and dtype.
-
-    Args:
-        input_shapes_dict: model input shapes, keyed by input name.
-
-    Returns:
-        Single-element list holding one random NHWC sample per input.
-    """
-    rng = np.random.default_rng(0)
-    return [
-        {
-            name: rng.random((1, shape[2], shape[3], shape[1]), dtype=np.float32)
-            for name, shape in input_shapes_dict.items()
-        }
-    ]
+    return boxes, best, class_ids
 
 
 def implement(args):
     # enable verbose error messages.
     enable_verbose_error_messages()
+
+    """
+    Confirm the class heads still emit logits, as the post-processing assumes.
+    Checked before anything is written, so a bad model cannot destroy the
+    previous run's results.
+    """
+    try:
+        _check_class_heads_are_logits(args.model_path)
+    except ValueError as exc:
+        print(f"[WARN] {exc}", file=sys.stderr, flush=True)
+        sys.exit(1)
 
     """
     Make results folder
@@ -722,19 +750,10 @@ def implement(args):
     input types dictionary: each key,value pair is an input name (string) and a type
     input shapes dictionary: each key,value pair is an input name (string) and a shape (tuple)
     """
-    (
-        input_shapes_dict,
-        input_types_dict,
-        output_shapes_dict,
-        output_types_dict,
-    ) = _get_onnx_shapes_dtypes(args.model_path)
+    input_shapes_dict, input_types_dict = _get_onnx_input_shapes_dtypes(args.model_path)
     print(DIVIDER)
-    print("ONNX model Inputs:")
+    print("Model Inputs:")
     for name, dims in input_shapes_dict.items():
-        print(f"{name}: {dims}")
-    print()
-    print("ONNX model Outputs:")
-    for name, dims in output_shapes_dict.items():
         print(f"{name}: {dims}")
     print(DIVIDER)
 
@@ -749,7 +768,7 @@ def implement(args):
     target = gen2_target if args.generation == 2 else gen1_target
 
     # load ONNX floating-point model into SiMa's LoadedNet format
-    loaded_net = load_model(importer_params, target=target, log_level=logging.INFO)
+    loaded_net = load_model(importer_params, flexible_batch_size=False, target=target, log_level=logging.INFO)
     print(f"Loaded model from {args.model_path}", flush=True)
 
     """
@@ -770,16 +789,26 @@ def implement(args):
 
     num_calib_samples = min(args.num_calib_samples, len(calib_data))
 
+
     """
     Quantize
     """
     # set number of quantization precision bits and quantization scheme based on command line arguments
+    # bias correction is on by default: it measurably reduces INT8 score error on this model.
+    # BF16 never uses it - there is no calibration set to derive a correction from, only the single
+    # random sample that fixes the input shape, and BF16 has no quantization error worth correcting.
+    bias_correction = not args.no_bias_corr
     if args.precision == "bf16":
         print("Using BF16 quantization", flush=True)
         quant_config = bfloat16_quantization
+        if bias_correction:
+            print("BF16 precision: bias correction not applicable, skipping", flush=True)
+        bias_correction = False
     else:
         print("Using INT8 quantization", flush=True)
         quant_config = default_quantization
+        print(f"Bias correction: {'enabled' if bias_correction else 'disabled'}", flush=True)
+
 
     # quantization precision override: use BF16 quantization regardless of the global quant config
     override_nodes = []
@@ -791,16 +820,18 @@ def implement(args):
         )
         print(f"BF16 quantization override nodes: {override_nodes}", flush=True)
 
+
     if args.requant_mode == "tflite":
         # Use TFLite-style quantization
         requantization_mode = RequantizationMode.tflite
     else:
         requantization_mode = RequantizationMode.sima
 
+
     # set other quantization parameters
     quant_config = (
         quant_config \
-        .with_bias_correction(args.bias_corr) \
+        .with_bias_correction(bias_correction) \
         .with_calibration(CalibrationMethod.from_str(args.calib_method)) \
         .with_channel_equalization(args.chan_equal) \
         .with_smooth_quant(False) \
@@ -821,13 +852,6 @@ def implement(args):
         log_level=logging.WARN,
     )
 
-    # run per-layer quantization error analysis
-#    print("Running quantization error analysis...", flush=True)
-#    quant_model.analyze_quantization_error(evaluation_data=calib_data[0:10],
-#                                           error_metric='mse',
-#                                           log_level=logging.INFO,
-#                                           local_feed=True)
-
     # optional save of quantized model - saved model can be opened with Netron
     quant_model.save(model_name=output_model_name, output_directory=str(results_dir))
     print(
@@ -843,12 +867,9 @@ def implement(args):
         use_jax = (args.executor == "jax")
         print(f"Executing quantized model (backend={'jax' if use_jax else 'normal'})...", flush=True)
 
-        # annotated images go alongside the float pipeline's output folders
-        annotated_dir = (args.build_dir.resolve() / "quant_mod_pred").resolve()
-        if annotated_dir.exists():
-            shutil.rmtree(annotated_dir)
-        annotated_dir.mkdir(parents=True, exist_ok=True)
-        print(f"Annotated images will be written to {annotated_dir}", flush=True)
+        # annotated images sit alongside the float pipeline's output folders
+        utils.prepare_output_dir(str(args.pred_dir))
+        print(f"Annotated images will be written to {args.pred_dir}", flush=True)
 
         # prepare test data in the same way as calibration data
         test_data = _list_image_files(args.test_dir)
@@ -859,7 +880,6 @@ def implement(args):
         print(f"Using {num_test_samples} of {len(test_data)} test image(s)", flush=True)
 
         # iterate over test data and execute the quantized model on each preprocessed sample
-        # the output can be compared to expected results for evaluation
         total_dets = 0
         for n, s in input_shapes_dict.items():
             input_h, input_w = s[2], s[3]
@@ -904,13 +924,16 @@ def implement(args):
                         img_bgr, boxes_orig, scores, class_ids, utils.COCO_CLASSES
                     )
 
-                out_path = annotated_dir / image_path.name
+                # cv2.imwrite writes BGR, which is the layout the annotated image
+                # is already in; same base name as the test image, .png extension
+                out_path = args.pred_dir / f"{image_path.stem}.png"
                 if not cv2.imwrite(str(out_path), annotated):
                     raise RuntimeError(f"Failed to write output image: {out_path}")
                 print(f"  Annotated image written to: {out_path}")
 
         print(f"Evaluation done: {total_dets} detection(s) across "
               f"{num_test_samples} image(s).", flush=True)
+
 
     """
     Compile
@@ -935,12 +958,6 @@ def implement(args):
         flush=True,
     )
 
-    # extract elf and mpk json for use in benchmarking
-    archive_path = results_dir / f"{output_model_name}_mpk.tar.gz"
-    benchmark_dir = results_dir / "benchmark"
-    with tarfile.open(str(archive_path)) as tar:
-        tar.extract(f"{output_model_name}_mpk.json", str(benchmark_dir))
-        tar.extract(f"{output_model_name}_stage1_mla.elf", str(benchmark_dir))
 
     return
 
@@ -956,27 +973,28 @@ def run_main():
     ap.add_argument("-g",  "--generation", type=int,  default=2, choices=[1, 2], help="Target device: 1 = DaVinci, 2 = Modalix. Default is 2")
     ap.add_argument("-cd", "--calib_dir",  type=Path, default="./calib_images", help="Path to folder containing calibration samples. Default is ./calib_images")
     ap.add_argument("-td", "--test_dir",   type=Path, default="./test_images", help="Path to folder containing test samples. Default is ./test_images")
+    ap.add_argument("-pd", "--pred_dir",   type=Path, default="./build/quant_pred", help="Path to folder for the annotated result images. Default is ./build/quant_pred")
     # quantization options
-    ap.add_argument("-cm", "--calib_method", type=str, default="mse", choices=["mse", "min_max", "moving_average", "entropy", "percentile"], help="Calibration method. Default is mse")
+    ap.add_argument("-cm", "--calib_method", type=str, default="min_max", choices=["mse", "min_max", "moving_average", "entropy", "percentile"], help="Calibration method. Default is min_max")
     ap.add_argument("-nc", "--num_calib_samples", type=int, default=100, help="Number of calibration samples to use. Default is 100")
-    ap.add_argument("-nt", "--num_test_samples", type=int, default=10, help="Number of test samples to use. Default is 10")
-    ap.add_argument("-bc", "--bias_corr",  action="store_true", help="Use bias correction. Default is no bias correction")
+    ap.add_argument("-nt", "--num_test_samples", type=int, default=100, help="Number of test samples to use. Default is 100")
+    ap.add_argument("-nb", "--no_bias_corr", action="store_true", help="Disable bias correction. Default is bias correction enabled (INT8 only)")
     ap.add_argument("-ce", "--chan_equal", action="store_true", help="Use channel equalization. Default is no channel equalization")
     ap.add_argument("-p",  "--precision", type=str, default="int8", choices=["int8", "bf16"], help="Precision for quantization. Default is int8")
     ap.add_argument("-r", "--requant_mode",type=str, default="sima", choices=["sima", "tflite"], help="Requant mode. Default is sima")
     ap.add_argument("-e", "--evaluate",    action="store_true", help="Run evaluation of quantized model. Default is no evaluation")
     # detection post-processing options
     ap.add_argument("-ct", "--conf_thres", type=float, default=0.25, help="Confidence threshold for evaluation. Default is 0.25")
-    ap.add_argument("-mx", "--max_det",    type=int, default=300, help="Max detections kept by the end-to-end selection. Default is 300")
+    ap.add_argument("-mx", "--max_det",    type=int, default=300, help="Max detections kept after the confidence filter. Default is 300")
     # compile options
     ap.add_argument("-no", "--no_compile",       action="store_true", help="Disable compilation. Default is enabled")
     ap.add_argument("-a",  "--any_shape_on_mla", action="store_true", help="Allow any shape on MLA output tensor. Default is disabled")
     ap.add_argument("-au", "--automatic_layout_conversion", action="store_true", help="Enable automatic layout conversion. Default is disabled")
     # Advanced Tessellation
     ap.add_argument("-mt", "--mla_tess",   action="store_true", help="Enable tesselation on MLA. Default is disabled")
-    ap.add_argument("-md", "--mla_detess", action="store_true", help="Enable detesselation on MLA. Default is disabled")
+    ap.add_argument("-md", "--mla_detess", action="store_true", help="Enable detess on MLA. Default is disabled")
     # Engine for evaluation
-    ap.add_argument("--executor", default="jax", choices=["jax", "normal"], help="Backend for verification")
+    ap.add_argument("--executor", default="normal", choices=["jax", "normal"], help="Backend for verification")
     # Override nodes list for BF16 quantization
     ap.add_argument("-on", "--override_nodes", type=Path, default=None, help="Path of override nodes file")
 

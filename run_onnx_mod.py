@@ -32,20 +32,22 @@
 
 """
 Script functionality:
-Run ONNX inference for the post-surgery YOLO26-m model over a folder of images
-and write the annotated images to an output folder. It is the companion to
-run_onnx.py: comparing the two outputs confirms that the surgery performed by
-rewrite_yolo26m.py did not change the detections.
+Run ONNX inference for the post-surgery COCO-trained YOLO26m detector over a
+folder of images and write the annotated images to an output folder.
 
-Pre-processing matches run_onnx.py - the images are already letterboxed, so
-only BGR -> RGB, /255, HWC -> CHW and the batch dimension are applied.
+The post-surgery graph (./models/yolo26m_mod.onnx) stops at the six raw detection
+heads, so the decoding the original end-to-end export did internally happens here
+in numpy instead. This mirrors what Neat's BoxDecode does on the target, which is
+what makes this script the reference the compiled pipeline is checked against.
 
-Because the decode tail was stripped from the graph, the work it used to do
-happens here in numpy: a sigmoid on the class logits, an ltrb distance decode
-of the boxes (YOLO26 is DFL-free and regresses the four distances directly in
-grid-cell units), the three levels concatenated, then a confidence filter and
-a top-k of max_det. No NMS is needed - the one2one head is already NMS-free.
-Model, folders, confidence, max_det and image size are set on the command line.
+The shared helpers all come from utils.py; only the YOLO26-specific decoding lives
+here.
+
+The input images are expected to be letterboxed to the model's input size already -
+that is what get_coco.py writes into ./test_images. Pre-processing therefore skips
+the resize/pad entirely and only does the tensor conversion: BGR -> RGB, /255 to
+[0,1] float32, HWC -> CHW, batch dim -> (1,3,H,W). An image whose size does not
+match the model input is reported and skipped rather than silently rescaled.
 """
 
 import argparse
@@ -55,283 +57,218 @@ from typing import Dict, List, Tuple
 
 import cv2
 import numpy as np
+import onnx
 import onnxruntime as ort
 
 import utils
 
-# The six tensors rewrite_yolo26m.py leaves on the graph, coarsest level last.
-BBOX_OUTPUTS = ["bbox_0", "bbox_1", "bbox_2"]
-CLASS_OUTPUTS = ["class_prob_0", "class_prob_1", "class_prob_2"]
+
+# The three detection levels, in the order the heads are named. The stride of
+# each level is the model input size divided by that level's grid size, so
+# 640/80, 640/40 and 640/20.
+BBOX_OUTPUTS = ("bbox_0", "bbox_1", "bbox_2")
+CLASS_OUTPUTS = ("class_prob_0", "class_prob_1", "class_prob_2")
+
+# Head geometry of models/yolo26m_mod.onnx.
+BBOX_CHANNELS = 4
 NUM_CLASSES = 80
 
-
-def resolve_model_path(path: str) -> str:
-    """Accept an .onnx file or a folder holding exactly one .onnx model."""
-    if os.path.isdir(path):
-        onnx_files = sorted(f for f in os.listdir(path) if f.lower().endswith(".onnx"))
-        if not onnx_files:
-            raise FileNotFoundError(f"No .onnx model found in folder: {path}")
-        if len(onnx_files) > 1:
-            raise ValueError(
-                f"{len(onnx_files)} .onnx models found in '{path}' "
-                f"({', '.join(onnx_files)}); pass one with --model"
-            )
-        return os.path.join(path, onnx_files[0])
-    if not os.path.isfile(path):
-        raise FileNotFoundError(f"ONNX model not found: {path}")
-    return path
+# Ops that would mean a class head already emits probabilities, not logits.
+ACTIVATION_OPS = {"Sigmoid", "Softmax", "HardSigmoid", "LogSoftmax"}
 
 
-def get_input_shape(session: ort.InferenceSession, imgsz: int) -> Tuple[int, int]:
-    """Return this model's input height and width.
-
-    The ONNX graph's static input size wins; --imgsz covers a dynamic-shape export.
+def verify_class_heads_are_logits(model_path: str) -> None:
     """
-    shape = session.get_inputs()[0].shape  # (N, C, H, W), dims may be symbolic
-    input_h = int(shape[2]) if isinstance(shape[2], int) else int(imgsz)
-    input_w = int(shape[3]) if isinstance(shape[3], int) else int(imgsz)
-    return input_h, input_w
+    Confirm the class heads emit raw logits, not probabilities.
 
-
-def preprocess(img_bgr: np.ndarray, input_h: int, input_w: int) -> np.ndarray:
-    """Turn an already-letterboxed image into the model's input tensor.
-
-    No resize or pad happens here - the image is expected to arrive at the model's
-    input size (get_coco.py writes ./test_images that way), so this is only the
-    tensor conversion: BGR -> RGB, /255 to [0,1] float32, HWC -> CHW, batch dim.
-
-    Raises:
-        ValueError: if the image is not already at the model's input size, since
-            the boxes would then be in a space the caller does not correct for.
+    The post-processing here applies its own sigmoid, so a head that already
+    carries probabilities would be double-activated and every score would be
+    wrong. Raises ValueError rather than letting that happen silently.
     """
-    img_h, img_w = img_bgr.shape[:2]
-    if (img_h, img_w) != (input_h, input_w):
+    graph = onnx.load(model_path).graph
+    producer_by_tensor = {out: node for node in graph.node for out in node.output}
+
+    activated = {
+        name: producer_by_tensor[name].op_type
+        for name in CLASS_OUTPUTS
+        if name in producer_by_tensor
+        and producer_by_tensor[name].op_type in ACTIVATION_OPS
+    }
+    if activated:
         raise ValueError(
-            f"Image is {img_w}x{img_h} but the model input is {input_w}x{input_h}. "
-            f"This script expects images already letterboxed to the input size - "
-            f"run get_coco.py to produce them."
+            f"Class head(s) {activated} already apply an activation, so they emit "
+            f"probabilities, not raw logits. The post-processing in this script "
+            f"applies its own sigmoid and would double-activate them. Re-run "
+            f"rewrite_yolo26m.py to cut the class heads before the Sigmoid."
         )
 
-    img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
-    return np.expand_dims(np.transpose(img_rgb, (2, 0, 1)), axis=0)
-
-
-def check_output_names(session: ort.InferenceSession) -> List[str]:
-    """Fail early and clearly if this is not a post-surgery model."""
-    names = [o.name for o in session.get_outputs()]
-    missing = [n for n in BBOX_OUTPUTS + CLASS_OUTPUTS if n not in names]
-    if missing:
-        raise ValueError(
-            f"Model is missing the post-surgery output(s) {missing}; got {names}. "
-            f"This script expects a model produced by rewrite_yolo26m.py - use "
-            f"run_onnx.py for the stock end-to-end export."
-        )
-    return names
+    producers = ", ".join(
+        f"{name} <- {producer_by_tensor[name].op_type}"
+        for name in CLASS_OUTPUTS
+        if name in producer_by_tensor
+    )
+    print(f"Class heads emit raw logits ({producers})")
 
 
 def sigmoid(x: np.ndarray) -> np.ndarray:
-    """Numerically stable logistic activation."""
-    return np.where(
-        x >= 0.0,
-        1.0 / (1.0 + np.exp(-np.abs(x))),
-        np.exp(-np.abs(x)) / (1.0 + np.exp(-np.abs(x))),
-    ).astype(np.float32)
+    """
+    Numerically stable logistic function.
+    """
+    out = np.empty_like(x, dtype=np.float32)
+    pos = x >= 0
+    out[pos] = 1.0 / (1.0 + np.exp(-x[pos]))
+    exp_x = np.exp(x[~pos])
+    out[~pos] = exp_x / (1.0 + exp_x)
+    return out
+
+
+def preprocess(img_bgr: np.ndarray, input_h: int, input_w: int) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Turn one BGR image into the model's input tensor.
+
+    Returns the (1,3,H,W) float32 tensor and the RGB image the annotation is
+    drawn on.
+
+    Raises ValueError if the image is not already the model's input size: this
+    script does no resizing, so a mismatch would silently misplace every box.
+    """
+    h, w = img_bgr.shape[:2]
+    if (h, w) != (input_h, input_w):
+        raise ValueError(
+            f"image is {w}x{h}, expected {input_w}x{input_h}; "
+            "this script does not resize - use get_coco.py to letterbox the images"
+        )
+
+    img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+    tensor = img_rgb.astype(np.float32) / 255.0      # [0,1]
+    tensor = np.transpose(tensor, (2, 0, 1))         # HWC -> CHW
+    tensor = np.expand_dims(tensor, axis=0)          # -> (1,3,H,W)
+    return np.ascontiguousarray(tensor), img_rgb
 
 
 def decode_level(
-    bbox_level: np.ndarray, cls_level: np.ndarray, input_h: int, input_w: int
-) -> Tuple[np.ndarray, np.ndarray]:
-    """Decode one head level into letterbox-pixel boxes and class probabilities.
+    bbox: np.ndarray,
+    class_logits: np.ndarray,
+    stride: float,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Decode one detection level into boxes, scores and class ids.
 
     Args:
-        bbox_level: (1, 4, H, W) ltrb distances in grid-cell units (no DFL).
-        cls_level:  (1, C, H, W) per-class logits (Sigmoid applied here).
-        input_h/input_w: network input size, used to recover this level's stride.
+        bbox:         (1,4,H,W) raw left/top/right/bottom distances, in grid cells.
+        class_logits: (1,80,H,W) raw class logits - the head is NMS-free and
+                      carries no objectness channel.
+        stride:       pixels per grid cell at this level.
 
-    Returns:
-        boxes_xyxy: (H*W, 4) in letterbox pixel space.
-        scores:     (H*W, C) probabilities.
+    The YOLO26 head is DFL-free, so the four box channels are the distances from
+    the cell's anchor point to each edge directly. The anchor point sits at the
+    centre of the cell, hence the +0.5.
     """
-    bbox = bbox_level[0]  # (4, H, W)
-    cls = cls_level[0]  # (C, H, W)
-
-    if bbox.shape[0] != 4:
-        raise ValueError(f"Expected 4 bbox channels, got {bbox.shape[0]}")
-    if bbox.shape[1:] != cls.shape[1:]:
+    _, channels, grid_h, grid_w = bbox.shape
+    if channels != BBOX_CHANNELS:
+        raise ValueError(f"expected {BBOX_CHANNELS} box channels, got {channels}")
+    if class_logits.shape[1] != NUM_CLASSES:
         raise ValueError(
-            f"bbox grid {bbox.shape[1:]} does not match class grid {cls.shape[1:]}"
+            f"expected {NUM_CLASSES} class channels, got {class_logits.shape[1]}"
         )
 
-    grid_h, grid_w = bbox.shape[1], bbox.shape[2]
+    left, top, right, bottom = bbox[0]                       # each (H,W)
 
-    # Both spatial ratios must agree, otherwise the level is not a clean stride.
-    stride_h, stride_w = input_h / grid_h, input_w / grid_w
-    if stride_h != stride_w:
-        raise ValueError(
-            f"Non-square stride for grid {grid_h}x{grid_w} at input "
-            f"{input_h}x{input_w}: {stride_h} vs {stride_w}"
-        )
-    stride = float(stride_h)
+    cx = (np.arange(grid_w, dtype=np.float32) + 0.5)[None, :]  # (1,W)
+    cy = (np.arange(grid_h, dtype=np.float32) + 0.5)[:, None]  # (H,1)
 
-    # (4, H, W) -> (H*W, 4), matching the row-major flatten the original graph used.
-    dist = bbox.reshape(4, -1).transpose(1, 0).astype(np.float32)
+    x1 = (cx - left) * stride
+    y1 = (cy - top) * stride
+    x2 = (cx + right) * stride
+    y2 = (cy + bottom) * stride
 
-    # Anchor centres in grid-cell units, +0.5 offset (Ultralytics make_anchors).
-    xs = np.arange(grid_w, dtype=np.float32) + 0.5
-    ys = np.arange(grid_h, dtype=np.float32) + 0.5
-    xv, yv = np.meshgrid(xs, ys)  # (H, W), x varies fastest
-    cx = xv.reshape(-1)
-    cy = yv.reshape(-1)
+    boxes = np.stack([x1, y1, x2, y2], axis=-1).reshape(-1, 4)
 
-    # dist2bbox in xyxy form, then scale grid units -> letterbox pixels.
-    x1 = (cx - dist[:, 0]) * stride
-    y1 = (cy - dist[:, 1]) * stride
-    x2 = (cx + dist[:, 2]) * stride
-    y2 = (cy + dist[:, 3]) * stride
-    boxes_xyxy = np.stack((x1, y1, x2, y2), axis=-1)
+    # sigmoid is monotonic, so the winning class is the largest logit and its
+    # probability is the sigmoid of that logit - no need to map all 80 channels.
+    logits = class_logits[0].reshape(NUM_CLASSES, -1)          # (80, H*W)
+    class_ids = np.argmax(logits, axis=0).astype(np.int32)     # (H*W,)
+    best_logit = logits[class_ids, np.arange(logits.shape[1])]
+    scores = sigmoid(best_logit.astype(np.float32))
 
-    # (C, H, W) -> (H*W, C); the heads emit logits, so activate here.
-    scores = sigmoid(cls.reshape(cls.shape[0], -1).transpose(1, 0).astype(np.float32))
-
-    return boxes_xyxy, scores
-
-
-def _topk(values: np.ndarray, k: int) -> np.ndarray:
-    """Indices of the k largest values, sorted descending (ONNX TopK semantics)."""
-    k = min(int(k), values.shape[0])
-    if k <= 0:
-        return np.empty((0,), dtype=np.int64)
-    part = np.argpartition(-values, k - 1)[:k]
-    return part[np.argsort(-values[part], kind="stable")].astype(np.int64)
+    return boxes.astype(np.float32), scores, class_ids
 
 
 def postprocess(
-    named_outputs: Dict[str, np.ndarray],
-    conf_thres: float,
-    max_det: int,
+    outputs: Dict[str, np.ndarray],
     input_h: int,
     input_w: int,
+    conf_thres: float,
+    max_det: int,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Decode the six post-surgery tensors into boxes/scores/class ids.
-
-    The class heads carry logits; decode_level activates them.
-
-    Concatenates the three levels, then reproduces the end-to-end selection the
-    surgery removed: top-k anchors by their best class score, then a flat top-k
-    over the (k, C) score matrix. No NMS - the one2one head does not need it.
     """
-    level_boxes = []
-    level_scores = []
-    for bbox_name, cls_name in zip(BBOX_OUTPUTS, CLASS_OUTPUTS):
-        boxes, scores = decode_level(
-            named_outputs[bbox_name], named_outputs[cls_name], input_h, input_w
-        )
-        level_boxes.append(boxes)
-        level_scores.append(scores)
+    Decode all three levels, apply the confidence threshold and cap at max_det.
 
-    boxes = np.concatenate(level_boxes, axis=0)  # (A, 4)
-    scores = np.concatenate(level_scores, axis=0)  # (A, C)
+    The YOLO26 head is NMS-free - it is trained to emit one box per object - so
+    no suppression is applied here either, matching BoxDecode on the target.
+    """
+    all_boxes: List[np.ndarray] = []
+    all_scores: List[np.ndarray] = []
+    all_class_ids: List[np.ndarray] = []
 
-    # Stage 1: keep the max_det anchors with the highest single-class score.
-    anchor_idx = _topk(scores.max(axis=1), max_det)
-    boxes = boxes[anchor_idx]
-    scores = scores[anchor_idx]
-
-    # Stage 2: flat top-k over the surviving (anchor, class) pairs.
-    flat = scores.reshape(-1)
-    flat_idx = _topk(flat, max_det)
-    final_scores = flat[flat_idx]
-    class_ids = (flat_idx % scores.shape[1]).astype(np.int64)
-    final_boxes = boxes[flat_idx // scores.shape[1]]
-
-    keep = final_scores >= conf_thres
-    return final_boxes[keep], final_scores[keep], class_ids[keep]
-
-
-def implement(args) -> None:
-    # Prepare output folder
-    utils.prepare_output_dir(args.output_dir)
-
-    # Load ONNX model
-    model_path = resolve_model_path(args.model)
-    session = ort.InferenceSession(model_path, providers=[args.provider])
-    input_name = session.get_inputs()[0].name
-    check_output_names(session)
-    input_h, input_w = get_input_shape(session, args.imgsz)
-
-    # Ask for the six tensors by name; graph order is not relied upon.
-    wanted = BBOX_OUTPUTS + CLASS_OUTPUTS
-
-    # Get all image paths from input folder
-    image_paths = utils.get_image_paths(args.input_dir)
-    if len(image_paths) == 0:
-        print(f"No image files found in folder: {args.input_dir}")
-        return
-
-    print(f"Model: {model_path}  input {input_w}x{input_h} ({args.provider})")
-    print(f"Post-surgery head: {', '.join(wanted)}")
-    print(f"Found {len(image_paths)} image(s) in '{args.input_dir}'")
-    print(f"Output images will be written to '{args.output_dir}'")
-
-    total_dets = 0
-    for img_path in image_paths:
-        filename = os.path.basename(img_path)
-        print(f"Processing image: {filename}", flush=True)
-
-        # Load original image (any size)
-        img_bgr = cv2.imread(img_path)
-        if img_bgr is None:
-            print(f"  WARNING: Could not read image, skipping: {img_path}")
-            continue
-
-        # Preprocess (already letterboxed -> NCHW tensor)
-        try:
-            img_input = preprocess(img_bgr, input_h, input_w)
-        except ValueError as exc:
-            print(f"  WARNING: {exc}")
-            continue
-
-        # Inference
-        outputs = session.run(wanted, {input_name: img_input})
-        named_outputs = dict(zip(wanted, outputs))
-
-        # The image is already in letterbox space, so these boxes need no rescaling
-        boxes_orig, scores, class_ids = postprocess(
-            named_outputs,
-            conf_thres=args.conf_thres,
-            max_det=args.max_det,
-            input_h=input_h,
-            input_w=input_w,
-        )
-
-        if boxes_orig.shape[0] == 0:
-            print("  No detections above confidence threshold.")
-            annotated = img_bgr.copy()
-        else:
-            total_dets += boxes_orig.shape[0]
-            summary = ", ".join(
-                f"{utils.COCO_CLASSES[c] if c < len(utils.COCO_CLASSES) else c}:{s:.2f}"
-                for c, s in zip(class_ids[:5], scores[:5])
-            )
-            print(f"  Detections: {boxes_orig.shape[0]} ({summary}"
-                  f"{', ...' if boxes_orig.shape[0] > 5 else ''})")
-            annotated = utils.draw_detections(
-                img_bgr, boxes_orig, scores, class_ids, utils.COCO_CLASSES
+    for bbox_name, class_name in zip(BBOX_OUTPUTS, CLASS_OUTPUTS):
+        bbox = outputs[bbox_name]
+        class_logits = outputs[class_name]
+        grid_h, grid_w = bbox.shape[2], bbox.shape[3]
+        stride_y = input_h / float(grid_h)
+        stride_x = input_w / float(grid_w)
+        if stride_y != stride_x:
+            raise ValueError(
+                f"{bbox_name}: non-square stride {stride_x} x {stride_y}; "
+                "this decode assumes a square grid"
             )
 
-        out_path = os.path.join(args.output_dir, filename)
-        if not cv2.imwrite(out_path, annotated):
-            raise RuntimeError(f"Failed to write output image: {out_path}")
-        print(f"  Annotated image written to: {out_path}")
+        boxes, scores, class_ids = decode_level(bbox, class_logits, stride_y)
+        all_boxes.append(boxes)
+        all_scores.append(scores)
+        all_class_ids.append(class_ids)
 
-    print(f"\nDone: {total_dets} detection(s) across {len(image_paths)} image(s).")
+    boxes = np.concatenate(all_boxes, axis=0)
+    scores = np.concatenate(all_scores, axis=0)
+    class_ids = np.concatenate(all_class_ids, axis=0)
+
+    keep = scores >= conf_thres
+    boxes, scores, class_ids = boxes[keep], scores[keep], class_ids[keep]
+
+    # Highest scoring first, then cap. No NMS.
+    order = np.argsort(-scores, kind="stable")
+    if max_det > 0:
+        order = order[:max_det]
+    boxes, scores, class_ids = boxes[order], scores[order], class_ids[order]
+
+    # Clamp to the image; the raw ltrb distances can point outside it. Neat's
+    # parse_bbox_bytes clamps the decoded BBOX payload to [0, img_w] / [0, img_h],
+    # so the same bounds are used here.
+    boxes[:, 0::2] = np.clip(boxes[:, 0::2], 0.0, float(input_w))
+    boxes[:, 1::2] = np.clip(boxes[:, 1::2], 0.0, float(input_h))
+
+    return boxes, scores, class_ids
 
 
-def run_main():
-    # construct the argument parser and parse the arguments
+def describe(class_ids: np.ndarray) -> str:
+    """
+    Render the detected classes as a comma-separated, de-duplicated list.
+    """
+    names = []
+    for cls_id in class_ids:
+        name = (
+            utils.COCO_CLASSES[cls_id]
+            if 0 <= cls_id < len(utils.COCO_CLASSES)
+            else f"id_{cls_id}"
+        )
+        if name not in names:
+            names.append(name)
+    return ", ".join(names) if names else "-"
+
+
+def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser(
-        description="Run the post-surgery YOLO26 ONNX detection over a folder of "
-                    "images."
+        description="Run post-surgery YOLO26m ONNX detection over a folder of images."
     )
     ap.add_argument(
         "--input-dir", type=str, default="./test_images",
@@ -339,13 +276,12 @@ def run_main():
     )
     ap.add_argument(
         "--model", type=str, default="./models/yolo26m_mod.onnx",
-        help="Path to the modified ONNX model produced by rewrite_yolo26m.py "
-             "(default: %(default)s)",
+        help="Path to the post-surgery ONNX model (default: %(default)s)",
     )
     ap.add_argument(
         "-o", "--output-dir", "--output_dir", dest="output_dir", type=str,
         default="./build/onnx_mod_pred",
-        help="Path to output folder for the overlayed images (default: %(default)s)",
+        help="Path to output folder for the annotated images (default: %(default)s)",
     )
     ap.add_argument(
         "--conf-thres", "--conf_thres", dest="conf_thres", type=float, default=0.25,
@@ -353,29 +289,94 @@ def run_main():
     )
     ap.add_argument(
         "--max-det", "--max_det", dest="max_det", type=int, default=300,
-        help="Maximum detections kept by the end-to-end selection "
-             "(default: %(default)s)",
+        help="Maximum detections kept per image (default: %(default)s)",
     )
-    ap.add_argument(
-        "--imgsz", type=int, default=640,
-        help="Input size to use when the ONNX graph has dynamic shapes "
-             "(default: %(default)s)",
-    )
-    ap.add_argument(
-        "--provider", type=str, default="CPUExecutionProvider",
-        choices=ort.get_available_providers(),
-        help="ONNX Runtime execution provider (default: %(default)s)",
-    )
-    args = ap.parse_args()
+    return ap.parse_args()
 
-    print("\n" + utils.DIVIDER, flush=True)
-    print(sys.version, flush=True)
-    print(utils.DIVIDER, flush=True)
 
-    implement(args)
+def main() -> int:
+    args = parse_args()
 
-    return
+    if not os.path.isfile(args.model):
+        print(f"ONNX model not found: {args.model}", file=sys.stderr)
+        return 1
+
+    image_paths = utils.get_image_paths(args.input_dir)
+    if not image_paths:
+        print(f"No images found in {args.input_dir}", file=sys.stderr)
+        return 1
+
+    session = ort.InferenceSession(args.model, providers=["CPUExecutionProvider"])
+    input_meta = session.get_inputs()[0]
+    _, _, input_h, input_w = input_meta.shape
+    output_names = [o.name for o in session.get_outputs()]
+
+    missing = [n for n in BBOX_OUTPUTS + CLASS_OUTPUTS if n not in output_names]
+    if missing:
+        print(
+            f"{args.model} does not look like the post-surgery model: "
+            f"missing outputs {missing}. Run rewrite_yolo26m.py first.",
+            file=sys.stderr,
+        )
+        return 1
+
+    try:
+        verify_class_heads_are_logits(args.model)
+    except ValueError as exc:
+        print(f"[WARN] {exc}", file=sys.stderr)
+        return 1
+
+    utils.prepare_output_dir(args.output_dir)
+
+    print(utils.DIVIDER)
+    print(f"Model       : {args.model}")
+    print(f"Input       : {input_meta.name} {input_meta.shape}")
+    print(f"Images      : {len(image_paths)} from {args.input_dir}")
+    print(f"Output      : {args.output_dir}")
+    print(f"conf={args.conf_thres}  max_det={args.max_det}  NMS=off")
+    print(utils.DIVIDER)
+
+    written = 0
+    for image_path in image_paths:
+        base = os.path.splitext(os.path.basename(image_path))[0]
+
+        img_bgr = cv2.imread(image_path, cv2.IMREAD_COLOR)
+        if img_bgr is None:
+            print(f"{base}: could not read, skipped", file=sys.stderr)
+            continue
+
+        try:
+            tensor, img_rgb = preprocess(img_bgr, input_h, input_w)
+        except ValueError as exc:
+            print(f"{base}: {exc}", file=sys.stderr)
+            continue
+
+        results = session.run(output_names, {input_meta.name: tensor})
+        outputs = dict(zip(output_names, results))
+
+        boxes, scores, class_ids = postprocess(
+            outputs, input_h, input_w, args.conf_thres, args.max_det
+        )
+
+        # Annotate the RGB image, then hand OpenCV the BGR it expects to write.
+        annotated_rgb = utils.draw_detections(
+            img_rgb, boxes, scores, class_ids, utils.COCO_CLASSES
+        )
+        annotated_bgr = cv2.cvtColor(annotated_rgb, cv2.COLOR_RGB2BGR)
+
+        out_path = os.path.join(args.output_dir, f"{base}.png")
+        if not cv2.imwrite(out_path, annotated_bgr):
+            print(f"{base}: failed to write {out_path}", file=sys.stderr)
+            continue
+
+        written += 1
+        print(f"{base}: {len(boxes)} detection(s) [{describe(class_ids)}]")
+
+    print(utils.DIVIDER)
+    print(f"Wrote {written} annotated image(s) to {args.output_dir}")
+    print(utils.DIVIDER)
+    return 0
 
 
 if __name__ == "__main__":
-    run_main()
+    sys.exit(main())
