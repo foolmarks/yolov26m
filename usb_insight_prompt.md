@@ -62,7 +62,8 @@
 * Execute on EV74 CVU:
     * Refer to the 0_preproc.json file inside the compiled model .tar.gz archive but implement these points:
         * Convert from USB camera's output video format to RGB.
-        * Letterbox resizing with center padding (black) to match the models input dimensions.
+        * Ultralytics-style letterbox resizing with center padding to match the models input dimensions.
+            * Padding color = 114
         * Scale pixel values by dividing by 255 to move values into the range 0.0 to 1.0.
         * Quantize.
         * Tessellate.
