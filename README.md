@@ -55,6 +55,12 @@ container's default `python3`. See STEP #2.
 | `agent_skills/assets/postproc_lib.py` | Reference post-processing for detection models: IoU, NMS, YOLOX output decoding and box drawing. Unused here: this model needs post-processing, but of a different shape - the YOLO26 head decodes per level with no NMS, so `run_modelsdk.py` mirrors Neat's `BoxDecode` instead, using the same decode `run_onnx_mod.py` does in STEP #6. |
 
 
+
+
+![Complete tutorial flow](./readme_images/flow.png)
+
+
+
 ## Preparation
 
 Refer to the SiMa [Developer Center](https://developer.sima.ai/) and read it carefully before starting.
