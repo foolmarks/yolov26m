@@ -1,9 +1,6 @@
 # Agentic AI promt file: Yolov26m C++ NEAT Application With USB camera input and Insight Display
 
-## General instructions
-* Do not make assumptions, stop and ask for clarification.
-* Do not modify any other scripts.
-* Do not recompile the model.
+* Read and obey instructions in CLAUDE.md
 
 
 ## Environment

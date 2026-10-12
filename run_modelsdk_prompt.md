@@ -1,7 +1,6 @@
 # Agentic AI prompt: Create Sima Quantize/Evaluate/Compile script
 
-* Do not make assumptions, stop and ask for clarification.
-* Do not modify any other scripts or ONNX models
+* Read and obey instructions in CLAUDE.md
 
 
 ## Environment

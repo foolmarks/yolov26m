@@ -266,6 +266,10 @@ Three asynchronous `Run`s - camera ingress, detection, and the encoder/sender - 
 own thread, so a stall in one cannot wedge the others. `CombinePolicy::ByFrame` pairs every
 detection set with the exact frame it came from, so the annotation is never one frame stale.
 
+
+![pipeline](./readme_images/app_usb_insight_pipeline.png)
+
+
 Two things make it hold the camera's full 30 fps at 1080p. Annotation happens **in NV12**, so no
 colour conversion runs on the APU at all - the frame that leaves the camera reaches the encoder
 unchanged apart from the drawn pixels, and NV12 is the Neat encoder's native input. And BoxDecode
