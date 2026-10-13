@@ -31,28 +31,14 @@
 """
 
 """
-Script functionality:
-Quantize, evaluate and compile the post-surgery YOLO26-m model with the SiMa
-Model SDK. The quantization parameters can be adjusted via command line args.
-
-The ONNX model is loaded into the SDK's LoadedNet form, calibrated on images
-from ./calib_images and quantized to int8 or bf16 (BF16 skips calibration), then
-saved to the build folder.
-
-With -e the quantized model is evaluated on ./test_images: the six raw head
-outputs are decoded in numpy the way Neat's BoxDecode decodes them on the target
-(sigmoid on the class logits, ltrb distance decode, best class per anchor,
-confidence filter, top-k cap, no NMS) and the annotated images are written to
-./build/quant_pred.
-
-Unless --no_compile, the model is compiled for the target (Gen 1 DaVinci or
-Gen 2 Modalix) and packed as an MPK .tar.gz in the build folder.
+Quantize and compile model.
+The quantization parameters can be adjusted via command line arguments
 """
 
 
 """
 Author: Mark Harvey
-Created: 20 Sep 2026
+Created: 13 Oct 2026
 """
 
 
@@ -89,18 +75,16 @@ from afe.ir.tensor_type import ScalarType
 from mlc.compiler.model_graph.l1_based import TensorTessellateParameters
 from afe.ir.node import node_is_tuple
 
-import utils
+from utils import COCO_CLASSES, draw_detections, prepare_output_dir
 
 
 DIVIDER = "-" * 50
 IMAGE_EXTENSIONS = {".bmp", ".gif", ".jpeg", ".jpg", ".png"}
 
-# Head geometry of models/yolo26m_mod.onnx: 4 ltrb channels, 80 COCO classes.
-BBOX_CHANNELS = 4
-NUM_CLASSES = 80
+# YOLO26m post-processing, as executed by Neat's BoxDecode
+CONF_THRES = 0.25
+MAX_DET = 300
 
-# Ops that would mean a class head already emits probabilities, not logits.
-ACTIVATION_OPS = {"Sigmoid", "Softmax", "HardSigmoid", "LogSoftmax"}
 
 
 InputDim = Union[int, str, None]
@@ -187,63 +171,6 @@ def _get_onnx_input_shapes_dtypes(
     return shapes_by_input, dtypes_by_input
 
 
-def _check_class_heads_are_logits(model_path: Path) -> None:
-    """
-    Confirm the class heads of the post-surgery model emit raw logits.
-
-    The post-processing below applies its own sigmoid, exactly as Neat's
-    BoxDecode does on the target, so a graph that already activates its class
-    scores would be double-activated and every score would be wrong. The check
-    looks at the node producing each 80-channel graph output and rejects the
-    model if it is an activation rather than the bare cv3 Conv.
-
-    Args:
-        model_path: path to the post-surgery ONNX model.
-
-    Raises:
-        ValueError: if no class head is found, or if one is already activated.
-    """
-    model = onnx.load(str(model_path))
-    graph = model.graph
-
-    # Map every graph output to the node that produces it.
-    producer_by_tensor = {
-        output_name: node for node in graph.node for output_name in node.output
-    }
-
-    class_outputs: List[str] = []
-    for value_info in graph.output:
-        dims = value_info.type.tensor_type.shape.dim
-        # (N, C, H, W): a class head is the one carrying NUM_CLASSES channels.
-        if len(dims) == 4 and dims[1].dim_value == NUM_CLASSES:
-            class_outputs.append(value_info.name)
-
-    if not class_outputs:
-        raise ValueError(
-            f"No {NUM_CLASSES}-channel class output found in {model_path}; this "
-            f"does not look like a model produced by rewrite_yolo26m.py."
-        )
-
-    activated = {
-        name: producer_by_tensor[name].op_type
-        for name in class_outputs
-        if name in producer_by_tensor
-        and producer_by_tensor[name].op_type in ACTIVATION_OPS
-    }
-    if activated:
-        raise ValueError(
-            f"Class head(s) {activated} already apply an activation, so they emit "
-            f"probabilities, not raw logits. The post-processing in this script "
-            f"applies its own sigmoid and would double-activate them. Re-run "
-            f"rewrite_yolo26m.py to cut the class heads before the Sigmoid."
-        )
-
-    producers = ", ".join(
-        f"{name} <- {producer_by_tensor[name].op_type}"
-        for name in class_outputs
-        if name in producer_by_tensor
-    )
-    print(f"Class heads emit raw logits ({producers})", flush=True)
 
 
 def _build_tessellate_parameters(mla_tess: bool, mla_detess: bool, quant_model: Any) -> Dict[str, TensorTessellateParameters]:
@@ -329,6 +256,7 @@ def _build_tessellate_parameters(mla_tess: bool, mla_detess: bool, quant_model: 
     return tess_params
 
 
+
 def _list_image_files(folder_path: Path) -> List[Path]:
     """
     Return a list of image file paths in the specified folder.
@@ -345,6 +273,7 @@ def _list_image_files(folder_path: Path) -> List[Path]:
             image_paths.append(entry)
 
     return image_paths
+
 
 
 def _prepare_results_dir(build_dir: Path, model_path: Path) -> Tuple[Path, str]:
@@ -369,359 +298,63 @@ def _prepare_results_dir(build_dir: Path, model_path: Path) -> Tuple[Path, str]:
     return results_dir, output_model_name
 
 
-def _to_tensor(img_bgr: np.ndarray, target_h: int, target_w: int) -> np.ndarray:
-    """
-    Convert an already-letterboxed BGR image into the model's input tensor.
 
-    Args:
-        img_bgr: source image as an (H, W, 3) BGR uint8 array.
-        target_h: network input height.
-        target_w: network input width.
+def _letterbox_params(src_h: int, src_w: int, target_h: int, target_w: int) -> Tuple[float, int, int, int, int]:
+    """
+    Ultralytics-style letterbox geometry.
 
     Returns:
-        Preprocessed image as a (1, target_h, target_w, 3) float32 array.
-
-    Raises:
-        ValueError: if the image is not already at the model's input size.
+        (scale, resized_w, resized_h, left_pad, top_pad)
     """
-    # === AGENT:BEGIN Image preprocessing ===
-    # BGR -> RGB, /255 into [0.0, 1.0], batch dimension. No resize, crop or pad:
-    # get_coco.py already writes ./calib_images and ./test_images letterboxed to
-    # the model input size, and rescaling here would put the decoded boxes in a
-    # coordinate space the evaluation does not correct for. The SDK wants NHWC
-    # even though the ONNX graph is NCHW, so no channel transpose is applied.
-    img_h, img_w = img_bgr.shape[:2]
-    if (img_h, img_w) != (target_h, target_w):
-        raise ValueError(
-            f"Image is {img_w}x{img_h} but the model input is {target_w}x{target_h}. "
-            f"This script expects images already letterboxed to the input size - "
-            f"run get_coco.py to produce them."
-        )
+    r = min(target_h / src_h, target_w / src_w)
+    new_w, new_h = round(src_w * r), round(src_h * r)
+    dw, dh = (target_w - new_w) / 2, (target_h - new_h) / 2
+    return r, new_w, new_h, round(dw - 0.1), round(dh - 0.1)
 
-    img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
-    preprocessed_image = np.expand_dims(img_rgb, axis=0)
-    # === AGENT:END Image preprocessing ===
-    return preprocessed_image
 
 
 def _preproc(image_path: Path, target_h: int, target_w: int) -> np.ndarray:
-    """
-    Load one already-letterboxed image and preprocess it for the model.
+    """Image proprocessing: BGR->RGB, letterbox (pad 114) if size differs, /255, NHWC float32."""
+    img = cv2.cvtColor(cv2.imread(str(image_path)), cv2.COLOR_BGR2RGB)
+    src_h, src_w = img.shape[:2]
+    if (src_h, src_w) != (target_h, target_w):
+        _, new_w, new_h, left, top = _letterbox_params(src_h, src_w, target_h, target_w)
+        img = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+        img = cv2.copyMakeBorder(img, top, target_h - new_h - top, left, target_w - new_w - left,
+                                 cv2.BORDER_CONSTANT, value=(114, 114, 114))
+    preprocessed_image = (img.astype(np.float32) / 255.0)[np.newaxis]
+    return preprocessed_image
 
-    The same path is used for calibration and evaluation data, as the SDK requires.
+
+
+def _postproc(outputs: List[np.ndarray], input_h: int) -> np.ndarray:
+    """
+    YOLO26 post-processing as executed by Neat's BoxDecode: sigmoid on the class logits,
+    best class per grid cell, confidence filter, raw l/t/r/b distance decode around
+    (cell + 0.5) * stride, top-k by score, no NMS.
 
     Args:
-        image_path: path to the image file to preprocess.
-        target_h: network input height.
-        target_w: network input width.
+        outputs: six NHWC tensors from .execute() in model output order
+                 (bbox_0, bbox_1, bbox_2, class_prob_0, class_prob_1, class_prob_2).
+        input_h: model input height.
 
     Returns:
-        Preprocessed image as a (1, target_h, target_w, 3) float32 array.
-
-    Raises:
-        FileNotFoundError: if the image cannot be read.
-        ValueError: if the image is not already at the model's input size.
+        (N, 6) array of [x1, y1, x2, y2, score, class_id] in model-input pixels.
     """
-    img_bgr = cv2.imread(str(image_path))
-    if img_bgr is None:
-        raise FileNotFoundError(f"Could not read image: {image_path}")
+    dets = []
+    for ltrb, logits in zip(outputs[:3], outputs[3:]):
+        ltrb, logits = ltrb[0], logits[0]                 # (H, W, 4), (H, W, 80)
+        stride = input_h / ltrb.shape[0]
+        score = 1.0 / (1.0 + np.exp(-logits.max(-1)))
+        cls = logits.argmax(-1)
+        ys, xs = np.nonzero(score >= CONF_THRES)
+        ax, ay = xs + 0.5, ys + 0.5
+        l, t, r, b = ltrb[ys, xs].T
+        dets.append(np.stack([(ax - l) * stride, (ay - t) * stride, (ax + r) * stride, (ay + b) * stride,
+                              score[ys, xs], cls[ys, xs]], axis=1))
+    dets = np.concatenate(dets)
+    return dets[np.argsort(-dets[:, 4])[:MAX_DET]]
 
-    return _to_tensor(img_bgr, target_h, target_w)
-
-
-def _data_prep(
-    folder_path: Path, num_images: int, input_shapes_dict: InputShapesByName
-) -> List[Dict[str, np.ndarray]]:
-    """
-    Build a list of input dictionaries from the images in a folder.
-
-    Args:
-        folder_path: folder holding the images.
-        num_images: maximum number of images to use.
-        input_shapes_dict: model input shapes, keyed by input name.
-
-    Returns:
-        List of {input_name: preprocessed NHWC tensor} dictionaries.
-    """
-    image_paths = _list_image_files(folder_path)[:num_images]
-
-    samples: List[Dict[str, np.ndarray]] = []
-    for image_path in image_paths:
-        samples.append(
-            {
-                name: _preproc(image_path, target_h=shape[2], target_w=shape[3])
-                for name, shape in input_shapes_dict.items()
-            }
-        )
-
-    return samples
-
-
-def _random_calib_data(
-    input_shapes_dict: InputShapesByName,
-) -> List[Dict[str, np.ndarray]]:
-    """
-    Build a single random calibration sample for BF16 quantization.
-
-    BF16 does not calibrate, but the API still needs one sample to establish
-    each input's shape and dtype.
-
-    Args:
-        input_shapes_dict: model input shapes, keyed by input name.
-
-    Returns:
-        Single-element list holding one random NHWC sample per input.
-    """
-    rng = np.random.default_rng(0)
-    return [
-        {
-            name: rng.random((1, shape[2], shape[3], shape[1]), dtype=np.float32)
-            for name, shape in input_shapes_dict.items()
-        }
-    ]
-
-
-# ---------------------------------------------------------------------------
-# Post-processing
-#
-# rewrite_yolo26m.py leaves six raw head tensors on the graph and deletes the
-# decode/selection tail, so all of that work happens here - the same maths that
-# Neat's BoxDecode runs on the target. YOLO26 is DFL-free, so the four bbox
-# channels are the ltrb distances directly, in grid-cell units; the class heads
-# are cut at the cv3 Conv and carry logits, so the sigmoid is applied here.
-# Because the images are already in letterbox space, the decoded boxes are in the
-# image's own coordinates and need no inverse mapping. The one2one head is
-# NMS-free, so selection is a top-k and a confidence filter, nothing more.
-#
-# The SDK hands back NHWC while the ONNX graph is NCHW, and at level 0 a class
-# tensor is (1,80,80,80) either way, so the layout is decided from the
-# unambiguous 4-channel bbox tensors and then applied to the class tensors.
-# ---------------------------------------------------------------------------
-
-
-def _split_outputs(
-    outputs: List[np.ndarray],
-) -> List[Tuple[np.ndarray, np.ndarray]]:
-    """
-    Sort the six raw head tensors into (bbox, class) pairs, finest level first.
-
-    Identifies tensors by channel count (4 = bbox, 80 = class) and pairs them by
-    grid size, so neither the execution order of the outputs nor the memory
-    layout has to be assumed.
-
-    Args:
-        outputs: list of six (1, ...) arrays as returned by Model.execute().
-
-    Returns:
-        List of (bbox_nchw, class_nchw) pairs ordered by descending grid size,
-        both arrays normalized to NCHW.
-
-    Raises:
-        ValueError: if the outputs are not a recognizable post-surgery head.
-    """
-    arrays = [np.asarray(o) for o in outputs]
-    if len(arrays) != 6:
-        raise ValueError(
-            f"Expected 6 outputs from the post-surgery model, got {len(arrays)}. "
-            f"Was the model produced by rewrite_yolo26m.py?"
-        )
-    for arr in arrays:
-        if arr.ndim != 4 or arr.shape[0] != 1:
-            raise ValueError(f"Expected a (1, ...) rank-4 output, got {arr.shape}")
-
-    # The bbox tensors are unambiguous: only they carry 4 channels.
-    if any(a.shape[3] == BBOX_CHANNELS for a in arrays):
-        channels_last = True
-    elif any(a.shape[1] == BBOX_CHANNELS for a in arrays):
-        channels_last = False
-    else:
-        raise ValueError(
-            f"No {BBOX_CHANNELS}-channel bbox tensor among output shapes "
-            f"{[a.shape for a in arrays]}"
-        )
-
-    def to_nchw(arr: np.ndarray) -> np.ndarray:
-        """Normalize one output to NCHW."""
-        return np.transpose(arr, (0, 3, 1, 2)) if channels_last else arr
-
-    bbox_by_grid: Dict[int, np.ndarray] = {}
-    class_by_grid: Dict[int, np.ndarray] = {}
-    for arr in arrays:
-        nchw = to_nchw(arr)
-        channels, grid_h, grid_w = nchw.shape[1], nchw.shape[2], nchw.shape[3]
-        if grid_h != grid_w:
-            raise ValueError(f"Expected a square head grid, got {grid_h}x{grid_w}")
-        if channels == BBOX_CHANNELS:
-            bbox_by_grid[grid_h] = nchw
-        elif channels == NUM_CLASSES:
-            class_by_grid[grid_h] = nchw
-        else:
-            raise ValueError(
-                f"Unexpected channel count {channels} in output of shape {arr.shape}"
-            )
-
-    if sorted(bbox_by_grid) != sorted(class_by_grid):
-        raise ValueError(
-            f"bbox grids {sorted(bbox_by_grid)} do not match class grids "
-            f"{sorted(class_by_grid)}"
-        )
-
-    # Finest level (largest grid) first, matching bbox_0 / class_prob_0.
-    return [
-        (bbox_by_grid[grid], class_by_grid[grid])
-        for grid in sorted(bbox_by_grid, reverse=True)
-    ]
-
-
-def _sigmoid(x: np.ndarray) -> np.ndarray:
-    """
-    Numerically stable logistic activation.
-
-    Args:
-        x: array of logits.
-
-    Returns:
-        Array of probabilities, float32.
-    """
-    return np.where(
-        x >= 0.0,
-        1.0 / (1.0 + np.exp(-np.abs(x))),
-        np.exp(-np.abs(x)) / (1.0 + np.exp(-np.abs(x))),
-    ).astype(np.float32)
-
-
-def _decode_level(
-    bbox_level: np.ndarray, cls_level: np.ndarray, input_h: int, input_w: int
-) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Decode one head level into letterbox-pixel boxes and class probabilities.
-
-    Anchors sit at (col + 0.5, row + 0.5) in grid-cell units and the box is
-    (anchor -/+ distance) * stride, matching the dist2bbox decode the surgery
-    removed from the ONNX graph.
-
-    Args:
-        bbox_level: (1, 4, H, W) ltrb distances in grid-cell units.
-        cls_level: (1, C, H, W) per-class logits.
-        input_h: network input height.
-        input_w: network input width.
-
-    Returns:
-        Tuple of (boxes_xyxy, scores) shaped (H*W, 4) and (H*W, C).
-
-    Raises:
-        ValueError: if the level's grid does not correspond to a square stride.
-    """
-    bbox = bbox_level[0]
-    cls = cls_level[0]
-    grid_h, grid_w = bbox.shape[1], bbox.shape[2]
-
-    stride_h, stride_w = input_h / grid_h, input_w / grid_w
-    if stride_h != stride_w:
-        raise ValueError(
-            f"Non-square stride for grid {grid_h}x{grid_w} at input "
-            f"{input_h}x{input_w}: {stride_h} vs {stride_w}"
-        )
-    stride = float(stride_h)
-
-    # (4, H, W) -> (H*W, 4), row-major, matching the original graph's flatten.
-    dist = bbox.reshape(BBOX_CHANNELS, -1).transpose(1, 0).astype(np.float32)
-
-    # Anchor centres in grid-cell units (Ultralytics make_anchors, offset 0.5).
-    xs = np.arange(grid_w, dtype=np.float32) + 0.5
-    ys = np.arange(grid_h, dtype=np.float32) + 0.5
-    xv, yv = np.meshgrid(xs, ys)
-    cx = xv.reshape(-1)
-    cy = yv.reshape(-1)
-
-    boxes_xyxy = np.stack(
-        (
-            (cx - dist[:, 0]) * stride,
-            (cy - dist[:, 1]) * stride,
-            (cx + dist[:, 2]) * stride,
-            (cy + dist[:, 3]) * stride,
-        ),
-        axis=-1,
-    )
-
-    # (C, H, W) -> (H*W, C); the heads emit logits, so activate here.
-    scores = _sigmoid(cls.reshape(cls.shape[0], -1).transpose(1, 0).astype(np.float32))
-    return boxes_xyxy, scores
-
-
-def _topk(values: np.ndarray, k: int) -> np.ndarray:
-    """
-    Return indices of the k largest values, sorted descending.
-
-    Mirrors ONNX TopK(largest=1, sorted=1) semantics.
-
-    Args:
-        values: 1-D array to rank.
-        k: number of indices to return; clamped to len(values).
-
-    Returns:
-        Int64 array of at most k indices.
-    """
-    k = min(int(k), values.shape[0])
-    if k <= 0:
-        return np.empty((0,), dtype=np.int64)
-    part = np.argpartition(-values, k - 1)[:k]
-    return part[np.argsort(-values[part], kind="stable")].astype(np.int64)
-
-
-def _postproc(
-    outputs: List[np.ndarray],
-    conf_thres: float,
-    max_det: int,
-    input_h: int,
-    input_w: int,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """
-    Decode the six post-surgery outputs into boxes, scores and class ids.
-
-    Concatenates the three levels, then selects the way BoxDecode does: one
-    detection per anchor carrying that anchor's best class, a confidence filter
-    and a top-k cap. NMS-free, as the one2one head was trained to be.
-
-    Args:
-        outputs: list of six raw head tensors from Model.execute().
-        conf_thres: confidence threshold applied after selection.
-        max_det: maximum detections kept by the top-k selection.
-        input_h: network input height.
-        input_w: network input width.
-
-    Returns:
-        Tuple of (boxes_xyxy, scores, class_ids) in letterbox pixel space.
-    """
-    level_boxes = []
-    level_scores = []
-    for bbox_level, cls_level in _split_outputs(outputs):
-        boxes, scores = _decode_level(bbox_level, cls_level, input_h, input_w)
-        level_boxes.append(boxes)
-        level_scores.append(scores)
-
-    boxes = np.concatenate(level_boxes, axis=0)
-    scores = np.concatenate(level_scores, axis=0)
-
-    # A BoxDecode BBOX record carries a single class_id, so each anchor yields
-    # at most one detection: its best class. Confidence filter first, then the
-    # top-k cap, so max_det bounds the detections that survive the threshold.
-    class_ids = scores.argmax(axis=1).astype(np.int64)
-    best = scores[np.arange(scores.shape[0]), class_ids]
-
-    keep = best >= conf_thres
-    boxes, best, class_ids = boxes[keep], best[keep], class_ids[keep]
-
-    order = _topk(best, max_det)
-    boxes, best, class_ids = boxes[order], best[order], class_ids[order]
-
-    # Clamp to the image; the raw ltrb distances can point outside it. Neat's
-    # parse_bbox_bytes clamps the decoded BBOX payload to [0, img_w] / [0, img_h],
-    # so the same bounds are used here.
-    boxes[:, 0::2] = np.clip(boxes[:, 0::2], 0.0, float(input_w))
-    boxes[:, 1::2] = np.clip(boxes[:, 1::2], 0.0, float(input_h))
-
-    return boxes, best, class_ids
 
 
 def implement(args):
@@ -729,20 +362,11 @@ def implement(args):
     enable_verbose_error_messages()
 
     """
-    Confirm the class heads still emit logits, as the post-processing assumes.
-    Checked before anything is written, so a bad model cannot destroy the
-    previous run's results.
-    """
-    try:
-        _check_class_heads_are_logits(args.model_path)
-    except ValueError as exc:
-        print(f"[WARN] {exc}", file=sys.stderr, flush=True)
-        sys.exit(1)
-
-    """
     Make results folder
     """
     results_dir, output_model_name = _prepare_results_dir(args.build_dir, args.model_path)
+
+
 
     """
     Load the floating-point ONNX model into Sima format
@@ -778,15 +402,15 @@ def implement(args):
     The dictionaries are appended to an iterable variable - a list is used in the example below
     """
     if args.precision == "bf16":
-        # BF16 does not calibrate; one random sample fixes shape and dtype.
-        calib_data = _random_calib_data(input_shapes_dict)
-        print("BF16 precision: using a single random calibration sample", flush=True)
+        # BF16 does not calibrate; one random NHWC sample fixes shape and dtype
+        calib_data = [
+            {n: np.random.rand(s[0], s[2], s[3], s[1]).astype(np.float32) for n, s in input_shapes_dict.items()}
+        ]
     else:
-        calib_data = _data_prep(args.calib_dir, args.num_calib_samples, input_shapes_dict)
-        if not calib_data:
-            raise FileNotFoundError(f"No calibration images found in {args.calib_dir}")
-        print(f"Prepared {len(calib_data)} calibration sample(s) from {args.calib_dir}", flush=True)
-
+        calib_data = [
+            {n: _preproc(image_path, target_h=s[2], target_w=s[3]) for n, s in input_shapes_dict.items()}
+            for image_path in _list_image_files(args.calib_dir)[:args.num_calib_samples]
+        ]
     num_calib_samples = min(args.num_calib_samples, len(calib_data))
 
 
@@ -794,20 +418,12 @@ def implement(args):
     Quantize
     """
     # set number of quantization precision bits and quantization scheme based on command line arguments
-    # bias correction is on by default: it measurably reduces INT8 score error on this model.
-    # BF16 never uses it - there is no calibration set to derive a correction from, only the single
-    # random sample that fixes the input shape, and BF16 has no quantization error worth correcting.
-    bias_correction = not args.no_bias_corr
     if args.precision == "bf16":
         print("Using BF16 quantization", flush=True)
         quant_config = bfloat16_quantization
-        if bias_correction:
-            print("BF16 precision: bias correction not applicable, skipping", flush=True)
-        bias_correction = False
     else:
         print("Using INT8 quantization", flush=True)
         quant_config = default_quantization
-        print(f"Bias correction: {'enabled' if bias_correction else 'disabled'}", flush=True)
 
 
     # quantization precision override: use BF16 quantization regardless of the global quant config
@@ -831,7 +447,7 @@ def implement(args):
     # set other quantization parameters
     quant_config = (
         quant_config \
-        .with_bias_correction(bias_correction) \
+        .with_bias_correction(args.bias_corr) \
         .with_calibration(CalibrationMethod.from_str(args.calib_method)) \
         .with_channel_equalization(args.chan_equal) \
         .with_smooth_quant(False) \
@@ -867,72 +483,34 @@ def implement(args):
         use_jax = (args.executor == "jax")
         print(f"Executing quantized model (backend={'jax' if use_jax else 'normal'})...", flush=True)
 
-        # annotated images sit alongside the float pipeline's output folders
-        utils.prepare_output_dir(str(args.pred_dir))
-        print(f"Annotated images will be written to {args.pred_dir}", flush=True)
-
         # prepare test data in the same way as calibration data
         test_data = _list_image_files(args.test_dir)
-        if not test_data:
-            raise FileNotFoundError(f"No test images found in {args.test_dir}")
+        pred_dir = args.build_dir / "quant_pred"
+        prepare_output_dir(str(pred_dir))
 
         num_test_samples = min(args.num_test_samples, len(test_data))
-        print(f"Using {num_test_samples} of {len(test_data)} test image(s)", flush=True)
 
         # iterate over test data and execute the quantized model on each preprocessed sample
-        total_dets = 0
+        # the output can be compared to expected results for evaluation
         for n, s in input_shapes_dict.items():
-            input_h, input_w = s[2], s[3]
             for image_path in test_data[:num_test_samples]:
-                print(f"Processing image: {image_path.name}", flush=True)
-
-                img_bgr = cv2.imread(str(image_path))
-                if img_bgr is None:
-                    print(f"  WARNING: Could not read image, skipping: {image_path}")
-                    continue
-
-                try:
-                    data = {n: _to_tensor(img_bgr, input_h, input_w)}
-                except ValueError as exc:
-                    print(f"  WARNING: {exc}")
-                    continue
-
+                data = {n: _preproc(image_path, target_h=s[2], target_w=s[3])}
                 quantized_net_output = quant_model.execute(data, fast_mode=True)
 
-                # decode the six raw head tensors; the image is already in letterbox
-                # space, so these boxes need no rescaling
-                boxes_orig, scores, class_ids = _postproc(
-                    quantized_net_output,
-                    conf_thres=args.conf_thres,
-                    max_det=args.max_det,
-                    input_h=input_h,
-                    input_w=input_w,
-                )
+                # decode, then map boxes from model-input space back to the original image
+                dets = _postproc(quantized_net_output, input_h=s[2])
+                img_rgb = cv2.cvtColor(cv2.imread(str(image_path)), cv2.COLOR_BGR2RGB)
+                src_h, src_w = img_rgb.shape[:2]
+                if (src_h, src_w) != (s[2], s[3]):
+                    r, _, _, left, top = _letterbox_params(src_h, src_w, s[2], s[3])
+                    dets[:, :4] = (dets[:, :4] - [left, top, left, top]) / r
 
-                if boxes_orig.shape[0] == 0:
-                    print("  No detections above confidence threshold.")
-                    annotated = img_bgr.copy()
-                else:
-                    total_dets += boxes_orig.shape[0]
-                    summary = ", ".join(
-                        f"{utils.COCO_CLASSES[c] if c < len(utils.COCO_CLASSES) else c}:{v:.2f}"
-                        for c, v in zip(class_ids[:5], scores[:5])
-                    )
-                    print(f"  Detections: {boxes_orig.shape[0]} ({summary}"
-                          f"{', ...' if boxes_orig.shape[0] > 5 else ''})")
-                    annotated = utils.draw_detections(
-                        img_bgr, boxes_orig, scores, class_ids, utils.COCO_CLASSES
-                    )
+                # annotate the original RGB image and write as BGR PNG
+                annotated = draw_detections(img_rgb, dets[:, :4], dets[:, 4], dets[:, 5].astype(int), COCO_CLASSES)
+                out_path = pred_dir / f"{image_path.stem}.png"
+                cv2.imwrite(str(out_path), cv2.cvtColor(annotated, cv2.COLOR_RGB2BGR))
+                print(f"{image_path.name}: {len(dets)} detections -> {out_path}", flush=True)
 
-                # cv2.imwrite writes BGR, which is the layout the annotated image
-                # is already in; same base name as the test image, .png extension
-                out_path = args.pred_dir / f"{image_path.stem}.png"
-                if not cv2.imwrite(str(out_path), annotated):
-                    raise RuntimeError(f"Failed to write output image: {out_path}")
-                print(f"  Annotated image written to: {out_path}")
-
-        print(f"Evaluation done: {total_dets} detection(s) across "
-              f"{num_test_samples} image(s).", flush=True)
 
 
     """
@@ -968,24 +546,20 @@ def run_main():
     ap = argparse.ArgumentParser()
     # paths and model info
     ap.add_argument("-bd", "--build_dir",  type=Path, default="build", help="Path of build folder. Default is build")
-    ap.add_argument("-m",  "--model_path", type=Path, default="./models/yolo26m_mod.onnx", help="path to ONNX model")
+    ap.add_argument("-m",  "--model_path", type=Path, default="./models/yolo26m_mod.onnx", help="path to ONNX model. Default is ./models/yolo26m_mod.onnx")
     ap.add_argument("-b",  "--batch_size", type=int,  default=1, help="requested batch size for compile. Default is 1")
     ap.add_argument("-g",  "--generation", type=int,  default=2, choices=[1, 2], help="Target device: 1 = DaVinci, 2 = Modalix. Default is 2")
     ap.add_argument("-cd", "--calib_dir",  type=Path, default="./calib_images", help="Path to folder containing calibration samples. Default is ./calib_images")
     ap.add_argument("-td", "--test_dir",   type=Path, default="./test_images", help="Path to folder containing test samples. Default is ./test_images")
-    ap.add_argument("-pd", "--pred_dir",   type=Path, default="./build/quant_pred", help="Path to folder for the annotated result images. Default is ./build/quant_pred")
     # quantization options
     ap.add_argument("-cm", "--calib_method", type=str, default="min_max", choices=["mse", "min_max", "moving_average", "entropy", "percentile"], help="Calibration method. Default is min_max")
     ap.add_argument("-nc", "--num_calib_samples", type=int, default=100, help="Number of calibration samples to use. Default is 100")
     ap.add_argument("-nt", "--num_test_samples", type=int, default=100, help="Number of test samples to use. Default is 100")
-    ap.add_argument("-nb", "--no_bias_corr", action="store_true", help="Disable bias correction. Default is bias correction enabled (INT8 only)")
+    ap.add_argument("-bc", "--bias_corr",  action="store_true", help="Use bias correction. Default is no bias correction")
     ap.add_argument("-ce", "--chan_equal", action="store_true", help="Use channel equalization. Default is no channel equalization")
     ap.add_argument("-p",  "--precision", type=str, default="int8", choices=["int8", "bf16"], help="Precision for quantization. Default is int8")
     ap.add_argument("-r", "--requant_mode",type=str, default="sima", choices=["sima", "tflite"], help="Requant mode. Default is sima")
     ap.add_argument("-e", "--evaluate",    action="store_true", help="Run evaluation of quantized model. Default is no evaluation")
-    # detection post-processing options
-    ap.add_argument("-ct", "--conf_thres", type=float, default=0.25, help="Confidence threshold for evaluation. Default is 0.25")
-    ap.add_argument("-mx", "--max_det",    type=int, default=300, help="Max detections kept after the confidence filter. Default is 300")
     # compile options
     ap.add_argument("-no", "--no_compile",       action="store_true", help="Disable compilation. Default is enabled")
     ap.add_argument("-a",  "--any_shape_on_mla", action="store_true", help="Allow any shape on MLA output tensor. Default is disabled")
