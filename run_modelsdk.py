@@ -38,7 +38,7 @@ The quantization parameters can be adjusted via command line arguments
 
 """
 Author: Mark Harvey
-Created: 13 Oct 2026
+Created: 2026-10-14
 """
 
 
@@ -75,16 +75,23 @@ from afe.ir.tensor_type import ScalarType
 from mlc.compiler.model_graph.l1_based import TensorTessellateParameters
 from afe.ir.node import node_is_tuple
 
-from utils import COCO_CLASSES, draw_detections, prepare_output_dir
+from utils import (
+    COCO_CLASSES,
+    draw_detections,
+    get_image_paths,
+    letterbox,
+    prepare_output_dir,
+    save_annotated,
+    unletterbox_boxes,
+)
 
 
 DIVIDER = "-" * 50
 IMAGE_EXTENSIONS = {".bmp", ".gif", ".jpeg", ".jpg", ".png"}
 
 # YOLO26m post-processing, as executed by Neat's BoxDecode
-CONF_THRES = 0.25
+CONF = 0.25
 MAX_DET = 300
-
 
 
 InputDim = Union[int, str, None]
@@ -257,25 +264,6 @@ def _build_tessellate_parameters(mla_tess: bool, mla_detess: bool, quant_model: 
 
 
 
-def _list_image_files(folder_path: Path) -> List[Path]:
-    """
-    Return a list of image file paths in the specified folder.
-    """
-    folder = folder_path
-    if not folder.exists():
-        raise FileNotFoundError(f"Folder does not exist: {folder}")
-    if not folder.is_dir():
-        raise NotADirectoryError(f"Path is not a directory: {folder}")
-
-    image_paths: List[Path] = []
-    for entry in sorted(folder.iterdir()):
-        if entry.is_file() and entry.suffix.lower() in IMAGE_EXTENSIONS:
-            image_paths.append(entry)
-
-    return image_paths
-
-
-
 def _prepare_results_dir(build_dir: Path, model_path: Path) -> Tuple[Path, str]:
     """
     Create a clean results directory under build_dir named after model_path stem.
@@ -299,62 +287,49 @@ def _prepare_results_dir(build_dir: Path, model_path: Path) -> Tuple[Path, str]:
 
 
 
-def _letterbox_params(src_h: int, src_w: int, target_h: int, target_w: int) -> Tuple[float, int, int, int, int]:
+def _preproc(image_path: Path, target_h: int, target_w: int) -> Tuple[np.ndarray, np.ndarray, float, int, int]:
     """
-    Ultralytics-style letterbox geometry.
-
-    Returns:
-        (scale, resized_w, resized_h, left_pad, top_pad)
+    Image preprocessing: read with OpenCV, BGR->RGB, Ultralytics letterbox (pad 114) if the
+    size differs from the model input, /255, NHWC float32.
+    Returns the preprocessed NHWC tensor, the original RGB image and the letterbox ratio and padding.
     """
-    r = min(target_h / src_h, target_w / src_w)
-    new_w, new_h = round(src_w * r), round(src_h * r)
-    dw, dh = (target_w - new_w) / 2, (target_h - new_h) / 2
-    return r, new_w, new_h, round(dw - 0.1), round(dh - 0.1)
+    img_rgb = cv2.cvtColor(cv2.imread(str(image_path)), cv2.COLOR_BGR2RGB)
+    x, r, pad_x, pad_y = img_rgb, 1.0, 0, 0
+    if img_rgb.shape[:2] != (target_h, target_w):
+        x, r, pad_x, pad_y = letterbox(img_rgb, target_h, target_w)
+    preprocessed_image = (x.astype(np.float32) / 255.0)[None]
+    return preprocessed_image, img_rgb, r, pad_x, pad_y
 
 
-
-def _preproc(image_path: Path, target_h: int, target_w: int) -> np.ndarray:
-    """Image proprocessing: BGR->RGB, letterbox (pad 114) if size differs, /255, NHWC float32."""
-    img = cv2.cvtColor(cv2.imread(str(image_path)), cv2.COLOR_BGR2RGB)
-    src_h, src_w = img.shape[:2]
-    if (src_h, src_w) != (target_h, target_w):
-        _, new_w, new_h, left, top = _letterbox_params(src_h, src_w, target_h, target_w)
-        img = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
-        img = cv2.copyMakeBorder(img, top, target_h - new_h - top, left, target_w - new_w - left,
-                                 cv2.BORDER_CONSTANT, value=(114, 114, 114))
-    preprocessed_image = (img.astype(np.float32) / 255.0)[np.newaxis]
-    return preprocessed_image
-
-
-
-def _postproc(outputs: List[np.ndarray], input_h: int) -> np.ndarray:
+def _box_decode(outputs: List[np.ndarray], in_h: int, in_w: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     YOLO26 post-processing as executed by Neat's BoxDecode: sigmoid on the class logits,
-    best class per grid cell, confidence filter, raw l/t/r/b distance decode around
-    (cell + 0.5) * stride, top-k by score, no NMS.
+    keep every (cell, class) above CONF, raw ltrb distance decode from cell centres,
+    top-k by score, no NMS.
 
     Args:
         outputs: six NHWC tensors from .execute() in model output order
                  (bbox_0, bbox_1, bbox_2, class_prob_0, class_prob_1, class_prob_2).
-        input_h: model input height.
+        in_h, in_w: model input height and width.
 
     Returns:
-        (N, 6) array of [x1, y1, x2, y2, score, class_id] in model-input pixels.
+        boxes (N,4) x1,y1,x2,y2 in model-input pixels, scores (N,), class_ids (N,).
     """
-    dets = []
+    boxes, scores, class_ids = [], [], []
     for ltrb, logits in zip(outputs[:3], outputs[3:]):
-        ltrb, logits = ltrb[0], logits[0]                 # (H, W, 4), (H, W, 80)
-        stride = input_h / ltrb.shape[0]
-        score = 1.0 / (1.0 + np.exp(-logits.max(-1)))
-        cls = logits.argmax(-1)
-        ys, xs = np.nonzero(score >= CONF_THRES)
+        ltrb = ltrb[0]                                    # (H, W, 4)
+        prob = 1.0 / (1.0 + np.exp(-logits[0]))           # (H, W, 80)
+        h, w, _ = ltrb.shape
+        sx, sy = in_w / w, in_h / h
+        ys, xs, cls = np.nonzero(prob > CONF)
         ax, ay = xs + 0.5, ys + 0.5
         l, t, r, b = ltrb[ys, xs].T
-        dets.append(np.stack([(ax - l) * stride, (ay - t) * stride, (ax + r) * stride, (ay + b) * stride,
-                              score[ys, xs], cls[ys, xs]], axis=1))
-    dets = np.concatenate(dets)
-    return dets[np.argsort(-dets[:, 4])[:MAX_DET]]
-
+        boxes.append(np.stack([(ax - l) * sx, (ay - t) * sy, (ax + r) * sx, (ay + b) * sy], 1))
+        scores.append(prob[ys, xs, cls])
+        class_ids.append(cls)
+    boxes, scores, class_ids = np.concatenate(boxes), np.concatenate(scores), np.concatenate(class_ids)
+    order = np.argsort(-scores)[:MAX_DET]
+    return boxes[order], scores[order], class_ids[order]
 
 
 def implement(args):
@@ -402,15 +377,18 @@ def implement(args):
     The dictionaries are appended to an iterable variable - a list is used in the example below
     """
     if args.precision == "bf16":
-        # BF16 does not calibrate; one random NHWC sample fixes shape and dtype
+        # BF16 does not use calibration data - one random NHWC float32 tensor per input sets shape and dtype
         calib_data = [
             {n: np.random.rand(s[0], s[2], s[3], s[1]).astype(np.float32) for n, s in input_shapes_dict.items()}
         ]
+        print("Prepared 1 random calibration sample for BF16", flush=True)
     else:
+        calib_paths = [Path(p) for p in get_image_paths(str(args.calib_dir))][:args.num_calib_samples]
         calib_data = [
-            {n: _preproc(image_path, target_h=s[2], target_w=s[3]) for n, s in input_shapes_dict.items()}
-            for image_path in _list_image_files(args.calib_dir)[:args.num_calib_samples]
+            {n: _preproc(p, target_h=s[2], target_w=s[3])[0] for n, s in input_shapes_dict.items()}
+            for p in calib_paths
         ]
+        print(f"Prepared {len(calib_data)} calibration samples from {args.calib_dir}", flush=True)
     num_calib_samples = min(args.num_calib_samples, len(calib_data))
 
 
@@ -484,7 +462,7 @@ def implement(args):
         print(f"Executing quantized model (backend={'jax' if use_jax else 'normal'})...", flush=True)
 
         # prepare test data in the same way as calibration data
-        test_data = _list_image_files(args.test_dir)
+        test_data = [Path(p) for p in get_image_paths(str(args.test_dir))]
         pred_dir = args.build_dir / "quant_pred"
         prepare_output_dir(str(pred_dir))
 
@@ -494,22 +472,19 @@ def implement(args):
         # the output can be compared to expected results for evaluation
         for n, s in input_shapes_dict.items():
             for image_path in test_data[:num_test_samples]:
-                data = {n: _preproc(image_path, target_h=s[2], target_w=s[3])}
+                x, img_rgb, r, pad_x, pad_y = _preproc(image_path, target_h=s[2], target_w=s[3])
+                data = {n: x}
                 quantized_net_output = quant_model.execute(data, fast_mode=True)
 
-                # decode, then map boxes from model-input space back to the original image
-                dets = _postproc(quantized_net_output, input_h=s[2])
-                img_rgb = cv2.cvtColor(cv2.imread(str(image_path)), cv2.COLOR_BGR2RGB)
-                src_h, src_w = img_rgb.shape[:2]
-                if (src_h, src_w) != (s[2], s[3]):
-                    r, _, _, left, top = _letterbox_params(src_h, src_w, s[2], s[3])
-                    dets[:, :4] = (dets[:, :4] - [left, top, left, top]) / r
+                # post-processing, then map boxes back to the original image and clip to it
+                boxes, scores, class_ids = _box_decode(quantized_net_output, in_h=s[2], in_w=s[3])
+                h, w = img_rgb.shape[:2]
+                boxes = np.clip(unletterbox_boxes(boxes, r, pad_x, pad_y), 0, [w, h, w, h])
 
                 # annotate the original RGB image and write as BGR PNG
-                annotated = draw_detections(img_rgb, dets[:, :4], dets[:, 4], dets[:, 5].astype(int), COCO_CLASSES)
-                out_path = pred_dir / f"{image_path.stem}.png"
-                cv2.imwrite(str(out_path), cv2.cvtColor(annotated, cv2.COLOR_RGB2BGR))
-                print(f"{image_path.name}: {len(dets)} detections -> {out_path}", flush=True)
+                annotated = draw_detections(img_rgb, boxes, scores, class_ids, COCO_CLASSES)
+                out_path = save_annotated(annotated, str(image_path), str(pred_dir))
+                print(f"{image_path.name}: {len(scores)} detections -> {out_path}", flush=True)
 
 
 

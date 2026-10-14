@@ -50,8 +50,17 @@ Always read and obey instructions in this file.
     * If the input tensor dimensions do not match the Yolo26m model input dimensions, use Ultralytics-style letterbox resizing and padding with color=114,114,114.
     * Normalize by dividing pixel values by `255` to move values into the `0.0` to `1.0` range.
     * For pipelines running on hardware, also need quantization and tesselation.
+* Check if suitable functions already exists in utils.py before creating new code.
+
+## Inference
+* ONNX inference:
+    * Assume that ONNX models have NCHW layout.
+* Compiled/packed models and post-quantization evaluation models:
+    * Assume NHWC layout.
+* All models have RGB ordering at their input.
 
 ## Post-Processing
+* This section describes the post-processing to be applied to the model outputs after inference:
 * For original ONNX model:
     * Assume fully decoded detections are being received from the model
     * Use: conf=0.25 max_det=300
@@ -64,25 +73,23 @@ Always read and obey instructions in this file.
 * For compiled models run in hardware as part of a pipeline:
     * Yolov26m post-processing executed by Neat's box decoder (BoxDecode) to produce bounding box coordinates.
         * Include Dequantization and Detesselation.
-        * Assume raw logits are being received from the model
+        * Assume raw logits are being received from the model.
         * Return bounding boxes that are sized to the original camera input dimensions - stop and warn if this is not possible.
         * Use: conf=0.25 max_det=300
         * No NMS
-
-## Inference
-* ONNX inference:
-    * Assume that ONNX models have NCHW layout
-* Compiled/packed models and post-quantization evaluation models:
-    * Assume NHWC layout.
-* All models have RGB ordering at their input.
+* Check if suitable functions already exists in utils.py before creating new code.
 
 
 ## Annotation
 * If images are to be annotated, the bounding boxes should be drawn as overlays. Include a text box on each bounding box that indicates class and score.
+* Check if suitable functions already exists in utils.py before creating new code.
+* The classes are listed in utils.py
+
 
 
 ## Annotated image write to file
 * Write the annotated image as a PNG file to the results images folder.
     * Transform to BGR before image write.
     * The image files should have the same base name as the test image read from the test images folder but should have a '.png' extension.
+* Check if suitable functions already exists in utils.py before creating new code.
 

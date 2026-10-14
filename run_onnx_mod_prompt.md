@@ -20,6 +20,5 @@
   python run_onnx_mod.py
 
 * Ensure that the Post surgery ONNX model results folder contains image files with bounding boxes overlaid on them.
-
-
+* Compare the images in the Post surgery ONNX model results folder with the corresponding images in the Original ONNX model results folder and ensure the bounding boxes and scores are identical within 1e-4 
 

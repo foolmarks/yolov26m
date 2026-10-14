@@ -41,10 +41,13 @@ Provides:
   - INPUT_H / INPUT_W, the 640x640 model input dimensions.
   - get_image_paths(), returning the sorted image files in a folder.
   - prepare_output_dir(), creating or cleaning an output folder.
+  - letterbox(), Ultralytics-style resize and pad with 114.
+  - preprocess(), reading an image and building the NCHW ONNX input tensor.
+  - unletterbox_boxes(), mapping boxes back to the original image.
+  - save_annotated(), writing an RGB image as a BGR PNG.
   - draw_detections(), overlaying boxes, class names and scores on an image.
 
-Pre-processing and decoding are not here: each script implements the variant
-its own model needs.
+Decoding is not here: each script implements the variant its own model needs.
 """
 
 
@@ -174,6 +177,43 @@ def prepare_output_dir(output_dir: str) -> None:
         # Remove and recreate
         shutil.rmtree(output_dir)
     os.makedirs(output_dir, exist_ok=True)
+
+
+def letterbox(img, new_h, new_w):
+    """Ultralytics-style letterbox: resize keeping aspect ratio, pad with 114."""
+    h, w = img.shape[:2]
+    r = min(new_h / h, new_w / w)
+    unpad_w, unpad_h = round(w * r), round(h * r)
+    dw, dh = (new_w - unpad_w) / 2, (new_h - unpad_h) / 2
+    if (w, h) != (unpad_w, unpad_h):
+        img = cv2.resize(img, (unpad_w, unpad_h), interpolation=cv2.INTER_LINEAR)
+    top, bottom = round(dh - 0.1), round(dh + 0.1)
+    left, right = round(dw - 0.1), round(dw + 0.1)
+    img = cv2.copyMakeBorder(img, top, bottom, left, right, cv2.BORDER_CONSTANT, value=(114, 114, 114))
+    return img, r, left, top
+
+
+def preprocess(path, in_h, in_w):
+    """Read image as RGB, letterbox if size differs, /255, NCHW float32.
+    Returns the original RGB image, the input tensor and the letterbox ratio and padding."""
+    img_rgb = cv2.cvtColor(cv2.imread(path), cv2.COLOR_BGR2RGB)
+    x, r, pad_x, pad_y = img_rgb, 1.0, 0, 0
+    if img_rgb.shape[:2] != (in_h, in_w):
+        x, r, pad_x, pad_y = letterbox(img_rgb, in_h, in_w)
+    x = (x.astype(np.float32) / 255.0).transpose(2, 0, 1)[None]
+    return img_rgb, x, r, pad_x, pad_y
+
+
+def unletterbox_boxes(boxes, r, pad_x, pad_y):
+    """Map x1, y1, x2, y2 boxes from letterboxed model-input pixels back to the original image."""
+    return (boxes - [pad_x, pad_y, pad_x, pad_y]) / r
+
+
+def save_annotated(img_rgb, path, results_dir):
+    """Write an RGB image as a BGR PNG named after the input image. Returns the output path."""
+    out_path = os.path.join(results_dir, os.path.splitext(os.path.basename(path))[0] + ".png")
+    cv2.imwrite(out_path, cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR))
+    return out_path
 
 
 def draw_detections(

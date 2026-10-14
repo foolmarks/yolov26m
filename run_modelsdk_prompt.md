@@ -13,7 +13,6 @@
     * Load the post-surgery ONNX model
     * Quantize using default quantization configuration
         * Include a CLI argument to select quantization precision, either INT8 or BF16 (default to INT8)
-            * If precision=BF16, only one calibration image is needed, it doesn't matter which one.
         * use min_max calibration method - set as default in CLI arguments.
     * Save the quantized model
     * If the '--evaluate' CLI argument is True
@@ -35,4 +34,6 @@
 
 * Verify that the compiled model tar.gz archive contains only one .elf file
     * If it does not, warn the user.
+* Ensure that the Post surgery ONNX model results folder contains image files with bounding boxes overlaid on them.
+* Compare the images in the Original ONNX model results folder with the corresponding images in the Post quantization model results folder and list any differences in number of detections.
 

@@ -2,7 +2,7 @@
 
 * Read and obey instructions in CLAUDE.md
 
-* Video input source: USB camera connected to paired devkit
+* Video input source: USB camera connected to synced devkit.
 
 * External Ubuntu machine Running Neat Insight
     * IP address: 192.168.1.29
@@ -70,5 +70,7 @@
 
 ## Verification
 * Build the application as an ARM64 target in the NEAT SDK container.
-* Run the application on the connected target board using `dk` commands.
+* Run the application on the connected target board using `dk` commands. Open Insight and display the output stream.
+
+
 
