@@ -40,6 +40,7 @@ container's default `python3`. See STEP #2.
 | Prompt | Description |
 | --- | --- |
 | `CLAUDE.md` | Project-wide instructions every prompt below defers to: model, image, results, compiled-model and application paths, the container and its `model-compiler` venv, the skills files inside the container, the Modalix target and the paired DevKit, preprocessing (BGR to RGB, Ultralytics letterbox with 114 padding when sizes differ, /255), BoxDecode-style post-processing (raw logits, conf=0.25, max_det=300, no NMS), NCHW/NHWC layouts, annotation style, PNG output, and the `staged_devkit.md` rule for anything staged on the DevKit. |
+| `AGENTS.md` | Same as CLAUDE.md but for Codex |
 | `run_onnx_prompt.md` | Specification for `run_onnx.py`: ONNX inference of the original model (STEP #4). |
 | `run_onnx_mod_prompt.md` | Specification for `run_onnx_mod.py`: ONNX inference of the post-surgery model with the box decode done in numpy (STEP #6). |
 | `run_modelsdk_prompt.md` | Specification for `run_modelsdk.py`: quantize, evaluate and compile with the SiMa.ai Model SDK (STEP #7). It also points the agent at `agent_skills/SKILL.md`, which wins on conflicts. |
@@ -305,7 +306,7 @@ no letterboxing or rescaling anywhere on the display path.
 See `app_usb_insight/README.md` for the prerequisites, build and run details.
 
 
-## On-baord telemetry with Sentinel
+## On-board telemetry with Sentinel
 
 [Sentinel](https://developer.sima.ai/software/tools/sentinel/) is SiMa.ai's metrics collector for
 the Modalix DevKit. A background daemon on the DevKit samples board thermal sensors, CPU load, Linux
