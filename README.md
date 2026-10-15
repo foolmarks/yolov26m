@@ -303,3 +303,27 @@ The full 1920x1080 camera frame is streamed - the boxes are drawn into the NV12 
 no letterboxing or rescaling anywhere on the display path.
 
 See `app_usb_insight/README.md` for the prerequisites, build and run details.
+
+
+## On-baord telemetry with Sentinel
+
+[Sentinel](https://developer.sima.ai/software/tools/sentinel/) is SiMa.ai's metrics collector for
+the Modalix DevKit. A background daemon on the DevKit samples board thermal sensors, CPU load, Linux
+and MLA allocator memory, disk usage and IO, network IO, and Modalix power draw over PMBus. The
+`simaai-sentinel` CLI reads the daemon's cache and shows live tables and terminal graphs. It can also
+record named checkpoints of workload runs so they can be compared later.
+
+Install it on the DevKit itself, because the daemon reads the hardware sensors directly, then open
+the terminal view:
+
+```shell
+sima-cli neat install sentinel
+simaai-sentinel
+```
+
+The screenshot below shows the Overview page: thermal, power, CPU, memory, MLA memory and network
+graphs above a table of current values.
+
+![Sentinel overview](./readme_images/sentinel.png)
+
+
