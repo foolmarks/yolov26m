@@ -1,6 +1,6 @@
 # Agentic AI promt file: Yolov26m C++ NEAT Application With USB camera input and Insight Display
 
-* Read and obey instructions in CLAUDE.md
+* Read and obey instructions in CLAUDE.md and AGENTS.md
 
 * Video input source: USB camera connected to synced devkit.
 

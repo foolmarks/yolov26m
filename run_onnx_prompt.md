@@ -1,6 +1,6 @@
 # Agentic AI prompt file: Create an ONNX inference script for the original ONNX model
 
-* Read and obey instructions in CLAUDE.md
+* Read and obey instructions in CLAUDE.md and AGENTS.md
 
 
 ## Task

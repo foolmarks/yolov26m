@@ -1,6 +1,6 @@
 # Agentic AI prompt: Create Sima Quantize/Evaluate/Compile script
 
-* Read and obey instructions in CLAUDE.md
+* Read and obey instructions in CLAUDE.md and AGENTS.md
 
 
 ## Extra skills
